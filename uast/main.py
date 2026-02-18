@@ -103,7 +103,7 @@ def cli() -> None:
 def start(
     agent: str,
     project: str,
-    output: str | None,
+    output: "str | None",
     threshold: float,
     block: bool,
     verbose: bool,
