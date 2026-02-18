@@ -49,7 +49,7 @@ class Display:
         self.console = console
         self.verbose = verbose
 
-    # ── Startup ──────────────────────────────────────────────────────────────
+    # -- Startup --------------------------------------------------------------
 
     def banner(self, agent: str, project: str, version: str = "0.1.0") -> None:
         self.console.print()
@@ -91,7 +91,7 @@ class Display:
         )
         self.console.print()
 
-    # ── Live analysis updates ────────────────────────────────────────────────
+    # -- Live analysis updates ------------------------------------------------
 
     def analyzing(self, package_name: str, ecosystem: str, source: str) -> None:
         """Show that analysis is in progress."""
@@ -112,7 +112,6 @@ class Display:
         is_alert = result.ars_score >= threshold
 
         if result.verdict == "clean" and not self.verbose:
-            # In non-verbose mode, just print a single clean line
             self.console.print(
                 f"  [{color}]{icon}[/{color}]  "
                 f"[dim][{ts}][/dim]  "
@@ -138,21 +137,32 @@ class Display:
 
         self.console.print(ars_text, highlight=False)
 
-        # Signals
-        for signal in result.signals:
-            if signal.severity == "info" and not self.verbose:
-                continue
-            sig_color = SEVERITY_COLORS.get(signal.severity, "dim")
+        # "Did you mean?" suggestion
+        if result.did_you_mean:
             self.console.print(
-                f"     [dim]·[/dim]  [{sig_color}][{signal.severity.upper()}][/{sig_color}]  "
-                f"{signal.title}",
+                f"     [dim]💡[/dim]  [bold]Did you mean '{result.did_you_mean}'?[/bold]",
                 highlight=False,
             )
-            if self.verbose and signal.detail:
+
+        # Signals
+        for sig in result.signals:
+            if sig.severity == "info" and not self.verbose:
+                continue
+            sig_color = SEVERITY_COLORS.get(sig.severity, "dim")
+            self.console.print(
+                f"     [dim]·[/dim]  [{sig_color}][{sig.severity.upper()}][/{sig_color}]  "
+                f"{sig.title}",
+                highlight=False,
+            )
+            if self.verbose and sig.detail:
                 self.console.print(
-                    f"          [dim]{signal.detail}[/dim]",
+                    f"          [dim]{sig.detail}[/dim]",
                     highlight=False,
                 )
+
+        # ARSM breakdown in verbose mode
+        if self.verbose and result.arsm:
+            self._show_arsm_breakdown(result.arsm)
 
         # Recommendation
         if is_alert or result.verdict != "clean":
@@ -162,6 +172,17 @@ class Display:
             )
 
         self.console.print()
+
+    def _show_arsm_breakdown(self, arsm: dict) -> None:
+        """Show ARSM dimension values."""
+        self.console.print(
+            f"     [dim]ARSM:[/dim]  "
+            f"[dim]AAL={arsm.get('aal', 0):.2f}[/dim]  "
+            f"[dim]CIS={arsm.get('cis', 0):.2f}[/dim]  "
+            f"[dim]PC={arsm.get('pc', 0):.2f}[/dim]  "
+            f"[dim]SRF={arsm.get('srf', 0):.2f}[/dim]",
+            highlight=False,
+        )
 
     def blocked(self, package_name: str) -> None:
         """Confirm a package was blocked."""
@@ -173,7 +194,17 @@ class Display:
             highlight=False,
         )
 
-    # ── Session end ──────────────────────────────────────────────────────────
+    def rolled_back(self, package_name: str) -> None:
+        """Confirm a package was rolled back (uninstalled after install completed)."""
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self.console.print(
+            f"  [red bold]↩[/red bold]  [dim][{ts}][/dim]  "
+            f"[bold red]ROLLED BACK[/bold red]  {package_name}  "
+            f"[dim](package uninstalled — install completed before block)[/dim]",
+            highlight=False,
+        )
+
+    # -- Session end ----------------------------------------------------------
 
     def shutdown(self, output_path: Path) -> None:
         """Print session end summary."""
@@ -185,7 +216,7 @@ class Display:
         )
         self.console.print()
 
-    # ── Standalone check command ─────────────────────────────────────────────
+    # -- Standalone check command ---------------------------------------------
 
     def show_analysis_result(self, result: AnalysisResult) -> None:
         """Display a full single-package analysis (for `uast check`)."""
@@ -207,15 +238,55 @@ class Display:
             f"[bold {color}]{result.ars_score:.1f} / 10.0[/bold {color}]",
         )
         summary.add_row(
+            "CVSS Base",
+            f"[dim]{result.cvss_base:.1f}[/dim]",
+        )
+        summary.add_row(
             "Verdict",
             f"[bold {color}]{icon}  {result.verdict.upper()}[/bold {color}]",
         )
         if result.avt_classes:
             summary.add_row("AVT Classes", "  ".join(result.avt_classes))
+        if result.did_you_mean:
+            summary.add_row("Did you mean?", f"[bold]{result.did_you_mean}[/bold]")
 
         self.console.print(
             Panel(summary, title="[dim]Supply Chain Analysis[/dim]", border_style="dim")
         )
+
+        # ARSM breakdown
+        if result.arsm:
+            self.console.print()
+            self.console.print("  [dim]ARSM Dimensions[/dim]")
+            arsm = result.arsm
+            arsm_table = Table.grid(padding=(0, 2))
+            arsm_table.add_column(style="dim", min_width=6)
+            arsm_table.add_column(min_width=30)
+            arsm_table.add_column(justify="right")
+
+            arsm_table.add_row(
+                "AAL",
+                "Agent Autonomy Level",
+                f"{arsm.get('aal', 0):.2f}",
+            )
+            arsm_table.add_row(
+                "CIS",
+                "Context Integrity Score",
+                f"{arsm.get('cis', 0):.2f}",
+            )
+            arsm_table.add_row(
+                "PC",
+                "Provenance Confidence",
+                f"{arsm.get('pc', 0):.2f}",
+            )
+            arsm_table.add_row(
+                "SRF",
+                "Systemic Replication Factor",
+                f"{arsm.get('srf', 0):.2f}",
+            )
+            self.console.print(
+                Panel(arsm_table, border_style="dim", padding=(0, 2))
+            )
 
         # Signals
         if result.signals:
@@ -223,15 +294,15 @@ class Display:
             self.console.print("  [dim]Detection Signals[/dim]")
             self.console.print()
 
-            for signal in result.signals:
-                sig_color = SEVERITY_COLORS.get(signal.severity, "dim")
+            for sig in result.signals:
+                sig_color = SEVERITY_COLORS.get(sig.severity, "dim")
                 self.console.print(
-                    f"  [{sig_color}][{signal.severity.upper()}][/{sig_color}]  "
-                    f"[bold]{signal.title}[/bold]",
+                    f"  [{sig_color}][{sig.severity.upper()}][/{sig_color}]  "
+                    f"[bold]{sig.title}[/bold]",
                     highlight=False,
                 )
                 self.console.print(
-                    f"       [dim]{signal.detail}[/dim]",
+                    f"       [dim]{sig.detail}[/dim]",
                     highlight=False,
                 )
                 self.console.print()
@@ -242,7 +313,7 @@ class Display:
         )
         self.console.print()
 
-    # ── Sessions list ────────────────────────────────────────────────────────
+    # -- Sessions list --------------------------------------------------------
 
     def list_sessions(self, sessions_dir: Path) -> None:
         """Display a table of saved sessions."""
@@ -262,12 +333,12 @@ class Display:
             try:
                 with open(report_path) as f:
                     data = json.load(f)
-                summary = data.get("summary", {})
+                report_summary = data.get("summary", {})
                 table.add_row(
                     report_path.name,
                     data.get("agent", "—"),
-                    str(summary.get("total_packages", 0)),
-                    f"[red]{summary.get('alerts', 0)}[/red]" if summary.get("alerts", 0) else "0",
+                    str(report_summary.get("total_packages", 0)),
+                    f"[red]{report_summary.get('alerts', 0)}[/red]" if report_summary.get("alerts", 0) else "0",
                     data.get("started_at", "")[:16],
                 )
             except Exception:
@@ -277,11 +348,11 @@ class Display:
         self.console.print(table)
         self.console.print()
 
-    # ── Report display ────────────────────────────────────────────────────────
+    # -- Report display -------------------------------------------------------
 
     def show_report(self, data: dict) -> None:
         """Display a saved JSON session report."""
-        summary = data.get("summary", {})
+        report_summary = data.get("summary", {})
         results = data.get("results", [])
 
         self.console.print()
@@ -291,10 +362,10 @@ class Display:
         self.console.print(f"  [dim]Date:[/dim]    {data.get('started_at', '—')[:16]}")
         self.console.print()
         self.console.print(
-            f"  [bold]{summary.get('total_packages', 0)}[/bold] packages analyzed  ·  "
-            f"[red bold]{summary.get('alerts', 0)}[/red bold] alerts  ·  "
-            f"[yellow]{summary.get('suspicious', 0)}[/yellow] suspicious  ·  "
-            f"[green]{summary.get('clean', 0)}[/green] clean"
+            f"  [bold]{report_summary.get('total_packages', 0)}[/bold] packages analyzed  ·  "
+            f"[red bold]{report_summary.get('alerts', 0)}[/red bold] alerts  ·  "
+            f"[yellow]{report_summary.get('suspicious', 0)}[/yellow] suspicious  ·  "
+            f"[green]{report_summary.get('clean', 0)}[/green] clean"
         )
         self.console.print()
 

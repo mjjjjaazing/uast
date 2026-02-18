@@ -34,10 +34,11 @@ UAST closes that gap.
 |---|---|---|
 | Adversarial package selection | AVT-D3-01 | Age × download velocity anomaly |
 | Name squatting / typosquatting | AVT-D3-01 | String similarity against popular packages |
-| Production-gated payloads | AVT-D3-02 | Behavioral sandbox under prod env simulation |
-| Transitive dependency contamination | AVT-D3-04 | Dependency graph depth analysis |
-| Hallucinated package names | AVT-D1-03 | Registry 404 detection |
-| Sparse / suspicious metadata | AVT-D4-01 | Metadata completeness scoring |
+| Production-gated payloads | AVT-D3-02 | Static AST analysis of package source |
+| Transitive dependency contamination | AVT-D3-04 | Recursive dependency graph traversal |
+| Hallucinated package names | AVT-D1-03 | Registry 404 detection + "did you mean?" |
+| Sparse / suspicious metadata | AVT-D4-01 | Metadata completeness + repository URL verification |
+| Download velocity anomalies | AVT-D3-01 | PyPI Stats / npm downloads API |
 
 ---
 
@@ -70,6 +71,9 @@ uast start --agent cursor --block
 
 # Verbose — show all package checks, not just alerts
 uast start --verbose
+
+# Deep mode — enable static payload analysis (AST scanning)
+uast start --agent cursor --deep
 ```
 
 ### Check a single package
@@ -78,6 +82,12 @@ uast start --verbose
 uast check requests
 uast check lodash --ecosystem npm
 uast check request-utils-async
+
+# JSON output
+uast check some-package --json
+
+# Specify agent context for ARSM scoring
+uast check some-package --agent cursor
 ```
 
 ### View saved reports
@@ -96,12 +106,14 @@ uast report ~/.uast/sessions/session_20250101_120000.json
 
 | Agent | Interception method | Status |
 |---|---|---|
-| [Claude Code](https://claude.ai/code) | MCP tool logs + process watcher | ✅ Supported |
+| [Claude Code](https://claude.ai/code) | Log file watcher + process watcher | ✅ Supported |
 | [Cursor](https://cursor.sh) | File watcher + process watcher | ✅ Supported |
-| [GitHub Copilot](https://github.com/features/copilot) | Git hooks + process watcher | ✅ Supported |
-| [Windsurf](https://codeium.com/windsurf) | Session API + process watcher | ✅ Supported |
-| [Codeium](https://codeium.com) | File watcher + process watcher | ✅ Supported |
+| [GitHub Copilot](https://github.com/features/copilot) | Git pre-commit hook + process watcher | ✅ Supported |
+| [Windsurf](https://codeium.com/windsurf) | Generic process + file watchers | ✅ Supported |
+| [Codeium](https://codeium.com) | Generic process + file watchers | ✅ Supported |
 | VS Code (native AI) | Extension API | 🔜 Phase 2 |
+
+**Note:** Windsurf and Codeium do not expose public APIs for deeper integration. UAST uses the same generic process monitoring and file watching that works across all agents. Claude Code additionally monitors `~/.claude/` log files for earlier install detection. Copilot installs a temporary `.git/hooks/pre-commit` that runs `uast check` on newly added packages (removed when the session ends).
 
 ---
 
@@ -123,9 +135,42 @@ where:
   CIS  = Context Integrity Score    (was the agent's context clean?)
   PC   = Provenance Confidence      (is the artifact traceable?)
   SRF  = Systemic Replication Factor (blast radius across your org)
+
+coefficients:
+  α = 0.30   β = 0.25   γ = 0.25   δ = 0.20
 ```
 
+Agent Autonomy Levels (AAL) by agent:
+
+| Agent | AAL | Rationale |
+|---|---|---|
+| Copilot | 0.5 | Suggestion-based, human accepts each change |
+| Codeium | 0.5 | Similar suggestion-based model |
+| Cursor | 0.7 | More autonomous — can execute commands |
+| Windsurf | 0.7 | Autonomous command execution |
+| Claude Code | 0.8 | Highest autonomy — can install, deploy, modify |
+
 Packages scoring above the threshold (default: 6.0) trigger an alert. At 7.5+ the verdict is critical.
+
+### Blocking mode
+
+With `--block`, UAST will:
+1. Attempt to kill the install process before it completes
+2. If the install already finished, roll back by running `pip uninstall -y` / `npm uninstall`
+
+### Deep analysis (`--deep`)
+
+With `--deep` (or always on `uast check`), UAST downloads the package source and runs static AST analysis to detect:
+
+| Signal | Pattern | Severity |
+|---|---|---|
+| PAYLOAD-001 | `os.getenv()`/`os.environ` gating code execution | high |
+| PAYLOAD-002 | `subprocess.*`/`os.system`/`os.exec*` | high |
+| PAYLOAD-003 | `base64.b64decode`/`codecs.decode` with literals | high |
+| PAYLOAD-004 | Network calls in setup.py | critical |
+| PAYLOAD-005 | `eval()`/`exec()` with non-literal arg | medium |
+| PAYLOAD-006 | `__import__()`/`importlib` with variable arg | medium |
+| PAYLOAD-007 | File writes to `~/.ssh/`, `~/.bashrc`, `/etc/` | critical |
 
 ---
 
@@ -157,11 +202,11 @@ Packages scoring above the threshold (default: 6.0) trigger an alert. At 7.5+ th
 
 ## Session reports
 
-Every session saves a structured JSON report:
+Every session saves a structured JSON report (schema v2):
 
 ```json
 {
-  "version": "1",
+  "version": "2",
   "agent": "cursor",
   "project": "/Users/mike/payments-api",
   "started_at": "2025-01-01T14:22:00",
@@ -174,7 +219,17 @@ Every session saves a structured JSON report:
     "clean": 7,
     "max_ars_score": 9.4
   },
-  "results": [...]
+  "results": [
+    {
+      "package_name": "request-utils-async",
+      "ars_score": 9.4,
+      "cvss_base": 7.5,
+      "verdict": "critical",
+      "avt_classes": ["AVT-D3-01", "AVT-D3-04"],
+      "arsm": {"aal": 0.7, "cis": 1.0, "pc": 0.3, "srf": 0.0},
+      "signals": [...]
+    }
+  ]
 }
 ```
 
@@ -204,15 +259,21 @@ The paper formalises three original contributions:
 **v0.1 — current**
 - Process watcher + file watcher (dual interception)
 - Supply chain analyzer (BDA MVP)
-- ARSM scoring engine
-- Terminal output + JSON session reports
+- ARSM scoring engine with full formula implementation
+- Hallucinated package detection with "did you mean?"
+- Download velocity anomaly detection
+- Transitive dependency graph resolution
+- Static AST payload analysis (`--deep`)
+- Repository URL verification
+- Agent-specific interception (Claude Code logs, Copilot git hooks)
+- Blocking mode with rollback fallback
+- Terminal output + JSON session reports (schema v2)
 - Claude Code, Cursor, Copilot, Windsurf, Codeium
 
 **v0.2**
 - Web dashboard with session history
 - Full AVT taxonomy classifier (all 22 classes)
 - Team sharing + alert webhooks (Slack, email)
-- All 6 agent integrations
 
 **v0.3**
 - Agent Reasoning Auditor (ARA layer)

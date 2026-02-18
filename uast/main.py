@@ -7,6 +7,7 @@ agent behavior that SAST and DAST were never designed to catch.
 """
 
 import sys
+import json as json_mod
 import signal
 import datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from rich.text import Text
 from uast.watcher import AgentWatcher
 from uast.reporter import SessionReporter
 from uast.display import Display
+from uast.analyzer import AGENT_AAL
 
 console = Console()
 
@@ -27,10 +29,10 @@ SUPPORTED_AGENTS = ["cursor", "claude-code", "copilot", "windsurf", "codeium", "
 BANNER = """
  ██╗   ██╗ █████╗ ███████╗████████╗
  ██║   ██║██╔══██╗██╔════╝╚══██╔══╝
- ██║   ██║███████║███████╗   ██║   
- ██║   ██║██╔══██║╚════██║   ██║   
- ╚██████╔╝██║  ██║███████║   ██║   
-  ╚═════╝ ╚═╝  ╚═╝╚══════╝   ╚═╝  
+ ██║   ██║███████║███████╗   ██║
+ ██║   ██║██╔══██║╚════██║   ██║
+ ╚██████╔╝██║  ██║███████║   ██║
+  ╚═════╝ ╚═╝  ╚═╝╚══════╝   ╚═╝
 """
 
 
@@ -100,6 +102,12 @@ def cli() -> None:
     default=False,
     help="Show all package checks, not just alerts.",
 )
+@click.option(
+    "--deep",
+    is_flag=True,
+    default=False,
+    help="Enable deep analysis (static payload scanning via AST).",
+)
 def start(
     agent: str,
     project: str,
@@ -107,6 +115,7 @@ def start(
     threshold: float,
     block: bool,
     verbose: bool,
+    deep: bool,
 ) -> None:
     """Start monitoring an AI coding agent session.
 
@@ -116,9 +125,13 @@ def start(
       uast start --agent cursor --project ./my-app
       uast start --agent claude-code --threshold 7.0 --block
       uast start --verbose --output ./reports/session.json
+      uast start --agent cursor --deep
     """
     project_path = Path(project).resolve()
     display = Display(console, verbose=verbose)
+
+    # Resolve AAL from agent choice
+    aal = AGENT_AAL.get(agent, 0.5)
 
     # Print startup banner
     display.banner(agent, str(project_path))
@@ -146,6 +159,8 @@ def start(
         block=block,
         display=display,
         reporter=reporter,
+        aal=aal,
+        deep=deep,
     )
 
     # Handle Ctrl+C gracefully
@@ -176,11 +191,9 @@ def report(report_path: str) -> None:
     Example:
       uast report ~/.uast/sessions/session_20250101_120000.json
     """
-    import json
-
     display = Display(console)
     with open(report_path) as f:
-        data = json.load(f)
+        data = json_mod.load(f)
     display.show_report(data)
 
 
@@ -200,7 +213,21 @@ def sessions() -> None:
 @cli.command()
 @click.argument("package_name")
 @click.option("--ecosystem", "-e", type=click.Choice(["pypi", "npm"]), default="pypi")
-def check(package_name: str, ecosystem: str) -> None:
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    default=False,
+    help="Output results as JSON.",
+)
+@click.option(
+    "--agent",
+    "-a",
+    type=click.Choice(SUPPORTED_AGENTS, case_sensitive=False),
+    default="auto",
+    help="Agent context for ARSM scoring.",
+)
+def check(package_name: str, ecosystem: str, json_output: bool, agent: str) -> None:
     """Manually check a single package against the supply chain analyzer.
 
     \b
@@ -208,20 +235,51 @@ def check(package_name: str, ecosystem: str) -> None:
       uast check requests
       uast check lodash --ecosystem npm
       uast check request-utils-async
+      uast check some-package --json
+      uast check some-package --agent cursor
     """
     from uast.analyzer import SupplyChainAnalyzer
 
+    aal = AGENT_AAL.get(agent, 0.5)
     display = Display(console)
-    analyzer = SupplyChainAnalyzer()
+    analyzer = SupplyChainAnalyzer(aal=aal, deep=True)
 
-    console.print(f"\n[dim]Analyzing [bold]{package_name}[/bold] ({ecosystem})...[/dim]")
+    if not json_output:
+        console.print(f"\n[dim]Analyzing [bold]{package_name}[/bold] ({ecosystem})...[/dim]")
 
     if ecosystem == "pypi":
         result = analyzer.analyze_pypi(package_name)
     else:
         result = analyzer.analyze_npm(package_name)
 
-    display.show_analysis_result(result)
+    if json_output:
+        output = {
+            "package_name": result.package_name,
+            "ecosystem": result.ecosystem,
+            "version": result.version,
+            "ars_score": result.ars_score,
+            "cvss_base": result.cvss_base,
+            "verdict": result.verdict,
+            "avt_classes": result.avt_classes,
+            "recommendation": result.recommendation,
+            "did_you_mean": result.did_you_mean,
+            "arsm": result.arsm,
+            "signals": [
+                {
+                    "signal_id": s.signal_id,
+                    "severity": s.severity,
+                    "title": s.title,
+                    "detail": s.detail,
+                    "score_contribution": s.score_contribution,
+                }
+                for s in result.signals
+            ],
+            "metadata": result.metadata,
+            "analyzed_at": result.analyzed_at,
+        }
+        click.echo(json_mod.dumps(output, indent=2))
+    else:
+        display.show_analysis_result(result)
 
 
 if __name__ == "__main__":

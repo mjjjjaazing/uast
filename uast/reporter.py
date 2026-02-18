@@ -4,36 +4,7 @@ SessionReporter — writes JSON session reports to disk.
 Every uast session produces a structured JSON report at
 ~/.uast/sessions/<timestamp>.json (or a user-specified path).
 
-Report schema:
-{
-  "version": "1",
-  "agent": "cursor",
-  "project": "/path/to/project",
-  "started_at": "2025-01-01T12:00:00",
-  "ended_at": "2025-01-01T12:30:00",
-  "summary": {
-    "total_packages": 12,
-    "alerts": 2,
-    "suspicious": 1,
-    "critical": 1,
-    "clean": 9
-  },
-  "results": [
-    {
-      "package_name": "request-utils-async",
-      "ecosystem": "pypi",
-      "version": "0.1.4",
-      "ars_score": 9.4,
-      "cvss_base": 7.5,
-      "verdict": "critical",
-      "avt_classes": ["AVT-D3-01", "AVT-D3-04"],
-      "recommendation": "Do not install...",
-      "source": "process:pip",
-      "signals": [...],
-      "analyzed_at": "2025-01-01T12:05:00"
-    }
-  ]
-}
+Report schema v2 adds ARSM dimensions and dependency tree summary.
 """
 
 from __future__ import annotations
@@ -49,7 +20,7 @@ from uast.analyzer import AnalysisResult
 class SessionReporter:
     """Accumulates analysis results and writes the final JSON report."""
 
-    REPORT_VERSION = "1"
+    REPORT_VERSION = "2"
 
     def __init__(
         self,
@@ -82,10 +53,13 @@ class SessionReporter:
                     "severity": s.severity,
                     "title": s.title,
                     "detail": s.detail,
+                    "score_contribution": s.score_contribution,
                 }
                 for s in result.signals
             ],
             "metadata": result.metadata,
+            "arsm": result.arsm,
+            "did_you_mean": result.did_you_mean,
         }
         self._results.append(entry)
 

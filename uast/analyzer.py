@@ -1,8 +1,8 @@
 """
 Supply chain analyzer — the core detection engine.
 
-Implements a lightweight version of UAST Layer 2 (Behavioral Dynamic Analysis)
-and the Agentic Risk Scoring Model (ARSM) for dependency risk assessment.
+Implements UAST Layer 2 (Behavioral Dynamic Analysis) and the
+Agentic Risk Scoring Model (ARSM) for dependency risk assessment.
 
 Detection signals:
   - Package age vs. download velocity (typosquatting / adversarial packages)
@@ -11,10 +11,16 @@ Detection signals:
   - Transitive dependency depth and anomalies
   - Known malicious pattern database
   - PyPI/npm metadata integrity signals
+  - Hallucinated package detection (registry 404 + "did you mean?")
+  - Download velocity anomaly detection
+  - Repository URL verification
+  - Static payload analysis (AST-based)
+  - ARSM scoring with agent-specific dimensions
 """
 
 from __future__ import annotations
 
+import math
 import re
 import time
 import datetime
@@ -23,6 +29,8 @@ from typing import Optional
 from difflib import SequenceMatcher
 
 import requests
+
+from uast.http_client import http_client
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -35,7 +43,16 @@ class PackageSignal:
     severity: str          # "critical", "high", "medium", "low", "info"
     title: str
     detail: str
-    score_contribution: float  # 0.0–1.0 contribution to risk
+    score_contribution: float  # 0.0-1.0 contribution to risk
+
+
+@dataclass
+class ARSMContext:
+    """Context for ARSM scoring dimensions."""
+    aal: float = 0.5   # Agent Autonomy Level (0-1)
+    cis: float = 1.0   # Context Integrity Score (0-1)
+    pc: float = 1.0    # Provenance Confidence (0-1)
+    srf: float = 0.0   # Systemic Replication Factor
 
 
 @dataclass
@@ -44,14 +61,17 @@ class AnalysisResult:
     package_name: str
     ecosystem: str          # "pypi" or "npm"
     version: str
-    ars_score: float        # 0.0–10.0 Agentic Risk Score
-    cvss_base: float        # 0.0–10.0 estimated base severity
+    ars_score: float        # 0.0-10.0 Agentic Risk Score
+    cvss_base: float        # 0.0-10.0 estimated base severity
     signals: list[PackageSignal] = field(default_factory=list)
     avt_classes: list[str] = field(default_factory=list)
     verdict: str = "clean"  # "clean", "suspicious", "critical"
     recommendation: str = "No issues detected."
     metadata: dict = field(default_factory=dict)
     analyzed_at: str = field(default_factory=lambda: datetime.datetime.utcnow().isoformat())
+    arsm: Optional[dict] = None          # ARSM breakdown
+    dependency_tree: Optional[dict] = None  # dep tree summary
+    did_you_mean: Optional[str] = None   # suggestion for hallucinated packages
 
     @property
     def is_flagged(self) -> bool:
@@ -114,6 +134,26 @@ POPULAR_NPM = [
     "request", "commander", "chalk", "debug", "fs-extra", "glob",
 ]
 
+# Download stats APIs
+PYPISTATS_API = "https://pypistats.org/api/packages/{name}/recent"
+NPM_DOWNLOADS_API = "https://api.npmjs.org/downloads/point/last-week/{name}"
+
+# ARSM coefficients
+ARSM_ALPHA = 0.3   # Agent Autonomy Level weight
+ARSM_BETA = 0.25   # Context Integrity Score weight
+ARSM_GAMMA = 0.25  # Provenance Confidence weight
+ARSM_DELTA = 0.2   # Systemic Replication Factor weight
+
+# AAL mapping for known agents
+AGENT_AAL = {
+    "copilot": 0.5,
+    "cursor": 0.7,
+    "claude-code": 0.8,
+    "windsurf": 0.7,
+    "codeium": 0.5,
+    "auto": 0.6,
+}
+
 
 # ---------------------------------------------------------------------------
 # Analyzer
@@ -124,11 +164,11 @@ class SupplyChainAnalyzer:
     Lightweight supply chain risk analyzer implementing UAST Layer 2 (BDA)
     and Layer 1 (SSA) heuristics for dependency risk scoring.
 
-    Scoring follows ARSM principles:
-        ARS = f(age_score, velocity_score, name_score, depth_score, metadata_score)
+    Scoring follows ARSM:
+        ARS = CVSS_Base x (1 + alpha*AAL + beta*(1-CIS) + gamma*(1-PC) + delta*log(1+SRF))
 
     Each signal contributes a weighted score component.
-    Final ARS is normalized to 0.0–10.0.
+    Final ARS is normalized to 0.0-10.0.
     """
 
     PYPI_API = "https://pypi.org/pypi/{name}/json"
@@ -137,12 +177,28 @@ class SupplyChainAnalyzer:
 
     # Signal weights (sum to 1.0)
     WEIGHTS = {
-        "age_velocity":   0.35,   # Age vs. download spike — strongest signal
-        "name_squatting": 0.25,   # Name similarity to popular packages
-        "pattern_match":  0.15,   # Known suspicious name patterns
-        "metadata":       0.15,   # Maintainer age, description quality
-        "depth":          0.10,   # Transitive dependency count anomaly
+        "age_velocity":   0.25,
+        "name_squatting": 0.20,
+        "pattern_match":  0.10,
+        "metadata":       0.10,
+        "depth":          0.10,
+        "payload":        0.25,
     }
+
+    def __init__(self, aal: float = 0.5, deep: bool = False) -> None:
+        self.aal = aal
+        self.deep = deep
+        self._resolver = None  # Lazy import to avoid circular
+
+    def _get_resolver(self):
+        if self._resolver is None:
+            from uast.resolver import DependencyResolver
+            self._resolver = DependencyResolver()
+        return self._resolver
+
+    def _get_payload_analyzer(self):
+        from uast.payload import PayloadAnalyzer
+        return PayloadAnalyzer()
 
     def analyze_pypi(self, package_name: str) -> AnalysisResult:
         """Analyze a PyPI package and return an AnalysisResult."""
@@ -169,22 +225,12 @@ class SupplyChainAnalyzer:
 
         # Fetch PyPI metadata
         try:
-            resp = requests.get(
+            resp = http_client.get(
                 self.PYPI_API.format(name=package_name),
                 timeout=self.REQUEST_TIMEOUT,
             )
             if resp.status_code == 404:
-                result.signals.append(PackageSignal(
-                    signal_id="META-404",
-                    severity="medium",
-                    title="Package not found on PyPI",
-                    detail="Package does not exist on PyPI. The agent may have hallucinated it or it was removed.",
-                    score_contribution=0.5,
-                ))
-                result.ars_score = 5.0
-                result.verdict = "suspicious"
-                result.recommendation = "Package not found. Do not install — verify the package name."
-                return result
+                return self._handle_hallucinated_package(result, package_name, "pypi")
 
             resp.raise_for_status()
             data = resp.json()
@@ -214,7 +260,7 @@ class SupplyChainAnalyzer:
 
         raw_score = 0.0
 
-        # ── Signal 1: Package age vs. download velocity ──────────────────────
+        # -- Signal 1: Package age vs. download velocity ----------------------
         age_signal, age_contribution = self._check_age_velocity_pypi(
             package_name, releases, info
         )
@@ -222,7 +268,7 @@ class SupplyChainAnalyzer:
             result.signals.append(age_signal)
         raw_score += age_contribution * self.WEIGHTS["age_velocity"]
 
-        # ── Signal 2: Name squatting ──────────────────────────────────────────
+        # -- Signal 2: Name squatting -----------------------------------------
         squatting_signal, squatting_contribution = self._check_name_squatting(
             package_name, POPULAR_PYPI
         )
@@ -230,28 +276,55 @@ class SupplyChainAnalyzer:
             result.signals.append(squatting_signal)
         raw_score += squatting_contribution * self.WEIGHTS["name_squatting"]
 
-        # ── Signal 3: Suspicious name pattern ────────────────────────────────
+        # -- Signal 3: Suspicious name pattern --------------------------------
         pattern_signal, pattern_contribution = self._check_name_patterns(package_name)
         if pattern_signal:
             result.signals.append(pattern_signal)
         raw_score += pattern_contribution * self.WEIGHTS["pattern_match"]
 
-        # ── Signal 4: Metadata quality ────────────────────────────────────────
+        # -- Signal 4: Metadata quality + repo URL verification ---------------
         meta_signal, meta_contribution = self._check_metadata_quality(info)
         if meta_signal:
             result.signals.append(meta_signal)
         raw_score += meta_contribution * self.WEIGHTS["metadata"]
 
-        # ── Signal 5: Dependency depth ────────────────────────────────────────
-        deps = info.get("requires_dist") or []
-        depth_signal, depth_contribution = self._check_dependency_depth(deps)
-        if depth_signal:
-            result.signals.append(depth_signal)
+        # -- Signal 5: Dependency tree ----------------------------------------
+        depth_signals, depth_contribution = self._check_dependency_tree(
+            package_name, "pypi", info.get("requires_dist") or []
+        )
+        for s in depth_signals:
+            result.signals.append(s)
         raw_score += depth_contribution * self.WEIGHTS["depth"]
 
-        # ── Compute final ARS ─────────────────────────────────────────────────
-        result.ars_score = round(min(raw_score * 10.0, 10.0), 1)
-        result.cvss_base = round(min(raw_score * 8.5, 10.0), 1)  # conservative base
+        # -- Signal 6: Payload analysis (deep mode or check command) ----------
+        payload_contribution = 0.0
+        if self.deep:
+            payload_signals = self._check_payload(package_name, "pypi", result.version)
+            for s in payload_signals:
+                result.signals.append(s)
+                payload_contribution = max(payload_contribution, s.score_contribution)
+        raw_score += payload_contribution * self.WEIGHTS["payload"]
+
+        # -- Compute ARSM score -----------------------------------------------
+        result.cvss_base = round(min(raw_score * 10.0, 10.0), 1)
+
+        arsm_ctx = ARSMContext(
+            aal=self.aal,
+            cis=1.0,  # Default — clean context assumed
+            pc=self._estimate_provenance_confidence(info),
+            srf=self._estimate_systemic_replication(package_name, "pypi"),
+        )
+        result.ars_score = round(self._compute_arsm(result.cvss_base, arsm_ctx), 1)
+        result.arsm = {
+            "aal": arsm_ctx.aal,
+            "cis": arsm_ctx.cis,
+            "pc": arsm_ctx.pc,
+            "srf": round(arsm_ctx.srf, 2),
+            "alpha": ARSM_ALPHA,
+            "beta": ARSM_BETA,
+            "gamma": ARSM_GAMMA,
+            "delta": ARSM_DELTA,
+        }
 
         # Set verdict and AVT classes
         result.verdict, result.avt_classes, result.recommendation = (
@@ -283,22 +356,12 @@ class SupplyChainAnalyzer:
             return result
 
         try:
-            resp = requests.get(
+            resp = http_client.get(
                 self.NPM_API.format(name=package_name),
                 timeout=self.REQUEST_TIMEOUT,
             )
             if resp.status_code == 404:
-                result.signals.append(PackageSignal(
-                    signal_id="META-404",
-                    severity="medium",
-                    title="Package not found on npm",
-                    detail="Package does not exist on npm. Verify the package name.",
-                    score_contribution=0.5,
-                ))
-                result.ars_score = 5.0
-                result.verdict = "suspicious"
-                result.recommendation = "Package not found. Do not install — verify the package name."
-                return result
+                return self._handle_hallucinated_package(result, package_name, "npm")
 
             resp.raise_for_status()
             data = resp.json()
@@ -328,13 +391,13 @@ class SupplyChainAnalyzer:
 
         raw_score = 0.0
 
-        # ── Signal 1: Package age ─────────────────────────────────────────────
+        # -- Signal 1: Package age --------------------------------------------
         age_signal, age_contribution = self._check_age_velocity_npm(data)
         if age_signal:
             result.signals.append(age_signal)
         raw_score += age_contribution * self.WEIGHTS["age_velocity"]
 
-        # ── Signal 2: Name squatting ──────────────────────────────────────────
+        # -- Signal 2: Name squatting -----------------------------------------
         squatting_signal, squatting_contribution = self._check_name_squatting(
             package_name, POPULAR_NPM
         )
@@ -342,27 +405,50 @@ class SupplyChainAnalyzer:
             result.signals.append(squatting_signal)
         raw_score += squatting_contribution * self.WEIGHTS["name_squatting"]
 
-        # ── Signal 3: Pattern match ───────────────────────────────────────────
+        # -- Signal 3: Pattern match ------------------------------------------
         pattern_signal, pattern_contribution = self._check_name_patterns(package_name)
         if pattern_signal:
             result.signals.append(pattern_signal)
         raw_score += pattern_contribution * self.WEIGHTS["pattern_match"]
 
-        # ── Signal 4: Metadata quality ────────────────────────────────────────
+        # -- Signal 4: Metadata quality ---------------------------------------
         meta_signal, meta_contribution = self._check_metadata_quality_npm(data)
         if meta_signal:
             result.signals.append(meta_signal)
         raw_score += meta_contribution * self.WEIGHTS["metadata"]
 
-        # ── Signal 5: Dependency depth ────────────────────────────────────────
+        # -- Signal 5: Dependency tree ----------------------------------------
         deps = list((latest_info.get("dependencies") or {}).keys())
-        depth_signal, depth_contribution = self._check_dependency_depth(deps)
-        if depth_signal:
-            result.signals.append(depth_signal)
+        depth_signals, depth_contribution = self._check_dependency_tree(
+            package_name, "npm", deps
+        )
+        for s in depth_signals:
+            result.signals.append(s)
         raw_score += depth_contribution * self.WEIGHTS["depth"]
 
-        result.ars_score = round(min(raw_score * 10.0, 10.0), 1)
-        result.cvss_base = round(min(raw_score * 8.5, 10.0), 1)
+        # -- Signal 6: Payload (npm not supported yet) ------------------------
+        # payload analysis only for pypi currently
+
+        # -- Compute ARSM score -----------------------------------------------
+        result.cvss_base = round(min(raw_score * 10.0, 10.0), 1)
+
+        arsm_ctx = ARSMContext(
+            aal=self.aal,
+            cis=1.0,
+            pc=self._estimate_provenance_confidence_npm(data),
+            srf=self._estimate_systemic_replication(package_name, "npm"),
+        )
+        result.ars_score = round(self._compute_arsm(result.cvss_base, arsm_ctx), 1)
+        result.arsm = {
+            "aal": arsm_ctx.aal,
+            "cis": arsm_ctx.cis,
+            "pc": arsm_ctx.pc,
+            "srf": round(arsm_ctx.srf, 2),
+            "alpha": ARSM_ALPHA,
+            "beta": ARSM_BETA,
+            "gamma": ARSM_GAMMA,
+            "delta": ARSM_DELTA,
+        }
 
         result.verdict, result.avt_classes, result.recommendation = (
             self._compute_verdict(result.ars_score, result.signals)
@@ -370,7 +456,180 @@ class SupplyChainAnalyzer:
 
         return result
 
-    # ── Private signal checks ────────────────────────────────────────────────
+    # -- ARSM computation -----------------------------------------------------
+
+    def _compute_arsm(self, cvss_base: float, ctx: ARSMContext) -> float:
+        """
+        Compute Agentic Risk Score using ARSM formula:
+        ARS = CVSS_Base x (1 + alpha*AAL + beta*(1-CIS) + gamma*(1-PC) + delta*log(1+SRF))
+        """
+        if cvss_base == 0.0:
+            return 0.0
+
+        multiplier = (
+            1.0
+            + ARSM_ALPHA * ctx.aal
+            + ARSM_BETA * (1.0 - ctx.cis)
+            + ARSM_GAMMA * (1.0 - ctx.pc)
+            + ARSM_DELTA * math.log(1.0 + ctx.srf)
+        )
+
+        return min(cvss_base * multiplier, 10.0)
+
+    def _estimate_provenance_confidence(self, info: dict) -> float:
+        """Estimate Provenance Confidence (0-1) from PyPI metadata."""
+        score = 0.0
+        checks = 0
+
+        # Repo URL exists
+        checks += 1
+        project_urls = info.get("project_urls") or {}
+        home_page = info.get("home_page", "")
+        has_url = bool(home_page) or bool(project_urls)
+        if has_url:
+            score += 1.0
+
+        # Author email present
+        checks += 1
+        if info.get("author_email"):
+            score += 1.0
+
+        # Classifiers present
+        checks += 1
+        if info.get("classifiers"):
+            score += 1.0
+
+        # License present
+        checks += 1
+        if info.get("license"):
+            score += 1.0
+
+        # Multiple releases (not just a single version)
+        checks += 1
+        # (We don't have releases here; give benefit of doubt)
+        score += 0.5
+
+        return score / checks if checks > 0 else 0.5
+
+    def _estimate_provenance_confidence_npm(self, data: dict) -> float:
+        """Estimate Provenance Confidence (0-1) from npm metadata."""
+        score = 0.0
+        checks = 0
+
+        checks += 1
+        if data.get("repository"):
+            score += 1.0
+
+        checks += 1
+        if data.get("author"):
+            score += 1.0
+
+        checks += 1
+        if data.get("maintainers"):
+            score += 1.0
+
+        checks += 1
+        latest = data.get("dist-tags", {}).get("latest", "")
+        latest_info = data.get("versions", {}).get(latest, {})
+        if latest_info.get("license"):
+            score += 1.0
+
+        checks += 1
+        if len(data.get("versions", {})) > 1:
+            score += 1.0
+
+        return score / checks if checks > 0 else 0.5
+
+    def _estimate_systemic_replication(self, name: str, ecosystem: str) -> float:
+        """Estimate Systemic Replication Factor from download stats."""
+        try:
+            downloads = self._fetch_download_stats(name, ecosystem)
+            if downloads is None:
+                return 0.0
+            # Normalize: 1M+ downloads/week = SRF 1.0
+            return min(downloads / 1_000_000.0, 5.0)
+        except Exception:
+            return 0.0
+
+    def _fetch_download_stats(self, name: str, ecosystem: str) -> Optional[int]:
+        """Fetch weekly download count. Returns None on failure."""
+        try:
+            if ecosystem == "pypi":
+                resp = http_client.get(
+                    PYPISTATS_API.format(name=name),
+                    timeout=5,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("data", {}).get("last_week", None)
+            else:
+                resp = http_client.get(
+                    NPM_DOWNLOADS_API.format(name=name),
+                    timeout=5,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("downloads", None)
+        except Exception:
+            pass
+        return None
+
+    # -- Hallucinated package detection ---------------------------------------
+
+    def _handle_hallucinated_package(
+        self, result: AnalysisResult, package_name: str, ecosystem: str
+    ) -> AnalysisResult:
+        """Handle a 404 — package doesn't exist on registry."""
+        # Find closest match ("did you mean?")
+        suggestion = self._find_closest_package(package_name, ecosystem)
+        detail = (
+            f"Package '{package_name}' does not exist on "
+            f"{'PyPI' if ecosystem == 'pypi' else 'npm'}. "
+            "The AI agent may have hallucinated this package name."
+        )
+        if suggestion:
+            detail += f" Did you mean '{suggestion}'?"
+            result.did_you_mean = suggestion
+
+        result.signals.append(PackageSignal(
+            signal_id="HALLUC-001",
+            severity="critical",
+            title="Hallucinated package — does not exist on registry",
+            detail=detail,
+            score_contribution=0.9,
+        ))
+        result.ars_score = 9.0
+        result.verdict = "critical"
+        result.avt_classes = ["AVT-D1-03"]
+        result.recommendation = (
+            "Do not install. Package does not exist — likely hallucinated by the AI agent."
+        )
+        if suggestion:
+            result.recommendation += f" Did you mean '{suggestion}'?"
+        return result
+
+    def _find_closest_package(self, name: str, ecosystem: str) -> Optional[str]:
+        """Find the closest known package name for 'did you mean?' suggestions."""
+        safe = PYPI_SAFE if ecosystem == "pypi" else NPM_SAFE
+        popular = POPULAR_PYPI if ecosystem == "pypi" else POPULAR_NPM
+        candidates = list(safe) + popular
+
+        clean = name.lower().replace("-", "").replace("_", "")
+        best_match = None
+        best_ratio = 0.0
+
+        for candidate in candidates:
+            clean_candidate = candidate.lower().replace("-", "").replace("_", "")
+            ratio = SequenceMatcher(None, clean, clean_candidate).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_match = candidate
+
+        if best_ratio >= 0.6 and best_match:
+            return best_match
+        return None
+
+    # -- Private signal checks ------------------------------------------------
 
     def _check_age_velocity_pypi(
         self, name: str, releases: dict, info: dict
@@ -397,7 +656,15 @@ class SupplyChainAnalyzer:
 
         age_days = (datetime.datetime.utcnow() - first_upload).days
 
-        # Very new package — elevated risk
+        # Check download velocity for anomaly detection
+        velocity_note = ""
+        downloads = self._fetch_download_stats(name, "pypi")
+        if downloads is not None and age_days < 30 and downloads > 10000:
+            velocity_note = (
+                f" Anomalous download velocity: {downloads:,} downloads/week "
+                f"for a {age_days}-day-old package."
+            )
+
         if age_days < 7:
             return PackageSignal(
                 signal_id="AGE-001",
@@ -406,23 +673,25 @@ class SupplyChainAnalyzer:
                 detail=(
                     f"{name} was first published {age_days} day(s) ago. "
                     "Adversarially crafted packages targeting AI agent heuristics "
-                    "are typically published within days of deployment. "
-                    "Treat very new packages with elevated scrutiny."
+                    "are typically published within days of deployment."
+                    + velocity_note
                 ),
                 score_contribution=0.85,
             ), 0.85
 
         if age_days < 30:
+            contribution = 0.55 if velocity_note else 0.45
             return PackageSignal(
-                signal_id="AGE-002",
-                severity="medium",
-                title=f"Package is only {age_days} days old",
+                signal_id="VEL-001" if velocity_note else "AGE-002",
+                severity="high" if velocity_note else "medium",
+                title=f"Package is {age_days} days old" + (" with anomalous velocity" if velocity_note else ""),
                 detail=(
                     f"{name} was published {age_days} days ago. "
                     "Recent packages have not yet been peer-reviewed by the community."
+                    + velocity_note
                 ),
-                score_contribution=0.45,
-            ), 0.45
+                score_contribution=contribution,
+            ), contribution
 
         if age_days < 90:
             return PackageSignal(
@@ -436,7 +705,7 @@ class SupplyChainAnalyzer:
         return None, 0.0
 
     def _check_age_velocity_npm(self, data: dict) -> tuple[Optional[PackageSignal], float]:
-        """Check npm package age."""
+        """Check npm package age with velocity analysis."""
         time_data = data.get("time", {})
         created_str = time_data.get("created", "")
         name = data.get("name", "unknown")
@@ -445,13 +714,20 @@ class SupplyChainAnalyzer:
             return None, 0.0
 
         try:
-            # npm uses ISO format with Z suffix
             created = datetime.datetime.fromisoformat(created_str.replace("Z", "+00:00"))
             created = created.replace(tzinfo=None)
         except ValueError:
             return None, 0.0
 
         age_days = (datetime.datetime.utcnow() - created).days
+
+        velocity_note = ""
+        downloads = self._fetch_download_stats(name, "npm")
+        if downloads is not None and age_days < 30 and downloads > 10000:
+            velocity_note = (
+                f" Anomalous download velocity: {downloads:,} downloads/week "
+                f"for a {age_days}-day-old package."
+            )
 
         if age_days < 7:
             return PackageSignal(
@@ -461,18 +737,23 @@ class SupplyChainAnalyzer:
                 detail=(
                     f"{name} was published {age_days} day(s) ago. "
                     "Very new packages should be treated with elevated scrutiny."
+                    + velocity_note
                 ),
                 score_contribution=0.85,
             ), 0.85
 
         if age_days < 30:
+            contribution = 0.55 if velocity_note else 0.45
             return PackageSignal(
-                signal_id="AGE-002",
-                severity="medium",
-                title=f"Package is {age_days} days old",
-                detail=f"{name} is a relatively new package ({age_days} days).",
-                score_contribution=0.45,
-            ), 0.45
+                signal_id="VEL-001" if velocity_note else "AGE-002",
+                severity="high" if velocity_note else "medium",
+                title=f"Package is {age_days} days old" + (" with anomalous velocity" if velocity_note else ""),
+                detail=(
+                    f"{name} is a relatively new package ({age_days} days)."
+                    + velocity_note
+                ),
+                score_contribution=contribution,
+            ), contribution
 
         return None, 0.0
 
@@ -542,7 +823,7 @@ class SupplyChainAnalyzer:
         return None, 0.0
 
     def _check_metadata_quality(self, info: dict) -> tuple[Optional[PackageSignal], float]:
-        """Check PyPI metadata completeness — sparse metadata is a risk signal."""
+        """Check PyPI metadata completeness with repo URL verification."""
         issues = []
         score = 0.0
 
@@ -557,6 +838,12 @@ class SupplyChainAnalyzer:
         if not info.get("home_page") and not info.get("project_urls"):
             issues.append("no project URL or homepage")
             score += 0.15
+        else:
+            # Verify repo URL if present
+            repo_url = self._extract_repo_url(info)
+            if repo_url and not self._verify_repository_url(repo_url):
+                issues.append(f"repository URL returns 404: {repo_url}")
+                score += 0.35
 
         if not info.get("license"):
             issues.append("no license specified")
@@ -574,7 +861,7 @@ class SupplyChainAnalyzer:
         return None, 0.0
 
     def _check_metadata_quality_npm(self, data: dict) -> tuple[Optional[PackageSignal], float]:
-        """Check npm metadata quality."""
+        """Check npm metadata quality with repo URL verification."""
         issues = []
         score = 0.0
 
@@ -585,6 +872,14 @@ class SupplyChainAnalyzer:
         if not data.get("repository"):
             issues.append("no repository URL")
             score += 0.2
+        else:
+            # Verify repo URL
+            repo = data.get("repository", {})
+            repo_url = repo.get("url", "") if isinstance(repo, dict) else str(repo)
+            repo_url = repo_url.replace("git+", "").replace("git://", "https://").rstrip(".git")
+            if repo_url and repo_url.startswith("http") and not self._verify_repository_url(repo_url):
+                issues.append(f"repository URL returns 404: {repo_url}")
+                score += 0.35
 
         if not data.get("author") and not data.get("maintainers"):
             issues.append("no author or maintainer information")
@@ -601,13 +896,139 @@ class SupplyChainAnalyzer:
 
         return None, 0.0
 
+    def _extract_repo_url(self, info: dict) -> Optional[str]:
+        """Extract a GitHub/GitLab URL from PyPI metadata."""
+        project_urls = info.get("project_urls") or {}
+        for key in ("Source", "Repository", "Homepage", "Source Code", "Code"):
+            url = project_urls.get(key, "")
+            if url and ("github.com" in url or "gitlab.com" in url):
+                return url
+
+        home_page = info.get("home_page", "")
+        if home_page and ("github.com" in home_page or "gitlab.com" in home_page):
+            return home_page
+
+        return None
+
+    def _verify_repository_url(self, url: str) -> bool:
+        """HEAD request to verify a repository URL is reachable."""
+        try:
+            resp = http_client.head(url, timeout=5)
+            return resp.status_code < 400
+        except Exception:
+            return True  # Network error — give benefit of doubt
+
+    def _check_dependency_tree(
+        self, package_name: str, ecosystem: str, direct_deps: list[str]
+    ) -> tuple[list[PackageSignal], float]:
+        """Resolve transitive dependency tree and check for anomalies."""
+        signals: list[PackageSignal] = []
+        max_contribution = 0.0
+
+        try:
+            resolver = self._get_resolver()
+            tree = resolver.resolve_tree(package_name, ecosystem)
+
+            if tree.dependency_tree:
+                pass  # Store for display later
+
+            # Check total transitive count
+            if tree.total_count > 50:
+                sig = PackageSignal(
+                    signal_id="DEPTH-001",
+                    severity="medium",
+                    title=f"Very high transitive dependency count ({tree.total_count})",
+                    detail=(
+                        f"Package has {tree.total_count} transitive dependencies. "
+                        f"High counts expand the attack surface for supply chain attacks (AVT-D3-04)."
+                    ),
+                    score_contribution=0.5,
+                )
+                signals.append(sig)
+                max_contribution = max(max_contribution, 0.5)
+
+            elif tree.total_count > 25:
+                sig = PackageSignal(
+                    signal_id="DEPTH-002",
+                    severity="low",
+                    title=f"Elevated transitive dependency count ({tree.total_count})",
+                    detail=f"Package has {tree.total_count} transitive dependencies.",
+                    score_contribution=0.3,
+                )
+                signals.append(sig)
+                max_contribution = max(max_contribution, 0.3)
+
+            # Check max depth
+            if tree.max_depth > 4:
+                sig = PackageSignal(
+                    signal_id="DEPTH-003",
+                    severity="medium",
+                    title=f"Deep dependency chain (depth {tree.max_depth})",
+                    detail=f"Dependency tree reaches depth {tree.max_depth}. Deep chains are harder to audit.",
+                    score_contribution=0.35,
+                )
+                signals.append(sig)
+                max_contribution = max(max_contribution, 0.35)
+
+            # Check for suspicious packages in tree
+            if tree.suspicious_packages:
+                sig = PackageSignal(
+                    signal_id="DEPTH-SUSP",
+                    severity="critical",
+                    title=f"Suspicious package(s) in dependency tree: {', '.join(tree.suspicious_packages[:3])}",
+                    detail=(
+                        f"Found {len(tree.suspicious_packages)} suspicious transitive "
+                        f"dependencies: {', '.join(tree.suspicious_packages[:5])}."
+                    ),
+                    score_contribution=0.9,
+                )
+                signals.append(sig)
+                max_contribution = max(max_contribution, 0.9)
+
+        except Exception:
+            # Fallback to simple direct dep count check
+            count = len(direct_deps)
+            if count > 25:
+                sig = PackageSignal(
+                    signal_id="DEPTH-001",
+                    severity="medium",
+                    title=f"Unusually high dependency count ({count} direct deps)",
+                    detail=f"This package declares {count} direct dependencies.",
+                    score_contribution=0.4,
+                )
+                signals.append(sig)
+                max_contribution = 0.4
+            elif count > 15:
+                sig = PackageSignal(
+                    signal_id="DEPTH-002",
+                    severity="low",
+                    title=f"Elevated dependency count ({count} direct deps)",
+                    detail=f"Package has {count} direct dependencies.",
+                    score_contribution=0.2,
+                )
+                signals.append(sig)
+                max_contribution = 0.2
+
+        return signals, max_contribution
+
+    def _check_payload(
+        self, package_name: str, ecosystem: str, version: str
+    ) -> list[PackageSignal]:
+        """Run static payload analysis on the package source."""
+        try:
+            analyzer = self._get_payload_analyzer()
+            return analyzer.analyze_package(package_name, ecosystem, version)
+        except Exception:
+            return []
+
+    # -- Legacy compat method (used by tests) ---------------------------------
+
     def _check_dependency_depth(
         self, deps: list[str]
     ) -> tuple[Optional[PackageSignal], float]:
-        """Flag unusual transitive dependency counts."""
+        """Flag unusual direct dependency counts (legacy, non-tree version)."""
         count = len(deps)
 
-        # A simple utility package with 20+ deps is unusual
         if count > 25:
             return PackageSignal(
                 signal_id="DEPTH-001",
@@ -636,16 +1057,26 @@ class SupplyChainAnalyzer:
         self, ars_score: float, signals: list[PackageSignal]
     ) -> tuple[str, list[str], str]:
         """Compute final verdict, AVT classes, and recommendation."""
-        avt_classes = []
+        avt_classes: list[str] = []
         has_critical = any(s.severity == "critical" for s in signals)
         has_squatting = any("SQUAT" in s.signal_id for s in signals)
+        has_halluc = any("HALLUC" in s.signal_id for s in signals)
         has_age = any("AGE-001" in s.signal_id for s in signals)
         has_pattern = any("PATTERN" in s.signal_id for s in signals)
+        has_payload = any("PAYLOAD" in s.signal_id for s in signals)
+        has_depth_susp = any("DEPTH-SUSP" in s.signal_id for s in signals)
 
         if has_squatting:
-            avt_classes.append("AVT-D3-01")  # Adversarial Dependency Selection
-        if has_age or has_pattern:
-            avt_classes.append("AVT-D3-04")  # Transitive Dependency Contamination
+            avt_classes.append("AVT-D3-01")
+        if has_halluc:
+            avt_classes.append("AVT-D1-03")
+        if has_age or has_pattern or has_depth_susp:
+            avt_classes.append("AVT-D3-04")
+        if has_payload:
+            avt_classes.append("AVT-D3-02")
+
+        # Deduplicate
+        avt_classes = list(dict.fromkeys(avt_classes))
 
         if ars_score >= 7.5 or has_critical:
             return (

@@ -9,11 +9,17 @@ Secondary: File watcher — monitors requirements.txt, package.json,
            pyproject.toml for changes. Catches agents that write
            dependency files rather than running installs directly
            (common in Cursor and Copilot workflows).
+
+Agent-specific:
+  - Claude Code: Watches ~/.claude/ for MCP-related log files
+  - Copilot: Installs/removes .git/hooks/pre-commit for package checks
+  - Windsurf/Codeium: Generic process + file watchers (no public APIs)
 """
 
 from __future__ import annotations
 
 import re
+import os
 import time
 import threading
 import subprocess
@@ -64,6 +70,45 @@ NPM_PATTERNS = [
     r"pnpm\s+install\s+(.+)",
     r"bun\s+add\s+(.+)",                     # bun support
 ]
+
+# Git hook script template for Copilot integration
+GIT_HOOK_SCRIPT = """#!/bin/sh
+# UAST pre-commit hook — checks newly added packages in dependency files
+# Installed by: uast start --agent copilot
+# This hook is automatically removed when the uast session ends.
+
+UAST_MARKER="# managed by uast"
+
+# Check if uast is available
+if ! command -v uast >/dev/null 2>&1; then
+    exit 0
+fi
+
+# Check requirements.txt changes
+for f in requirements.txt requirements-dev.txt; do
+    if git diff --cached --name-only | grep -q "$f"; then
+        ADDED=$(git diff --cached "$f" | grep '^+' | grep -v '^+++' | sed 's/^+//' | grep -v '^#' | grep -v '^-')
+        for pkg in $ADDED; do
+            PKG_NAME=$(echo "$pkg" | sed 's/[><=!~].*//')
+            if [ -n "$PKG_NAME" ]; then
+                uast check "$PKG_NAME" --ecosystem pypi 2>/dev/null
+            fi
+        done
+    fi
+done
+
+# Check package.json changes
+if git diff --cached --name-only | grep -q "package.json"; then
+    ADDED=$(git diff --cached package.json | grep '^+' | grep -v '^+++' | grep '"[^"]*":' | sed 's/.*"\\([^"]*\\)".*/\\1/')
+    for pkg in $ADDED; do
+        if [ -n "$pkg" ] && [ "$pkg" != "dependencies" ] && [ "$pkg" != "devDependencies" ]; then
+            uast check "$pkg" --ecosystem npm 2>/dev/null
+        fi
+    done
+fi
+
+exit 0
+"""
 
 
 def _extract_package_names(cmdline: str, ecosystem: str) -> list[tuple[str, str]]:
@@ -188,13 +233,58 @@ class DependencyFileHandler(FileSystemEventHandler):
                     pass
 
 
+class ClaudeCodeLogHandler(FileSystemEventHandler):
+    """
+    Watches ~/.claude/ for MCP-related log files to detect
+    install commands earlier than process monitoring.
+    """
+
+    INSTALL_PATTERNS = [
+        r"pip\s+install\s+([\w\-\.]+)",
+        r"npm\s+install\s+([\w\-\.@/]+)",
+        r"yarn\s+add\s+([\w\-\.@/]+)",
+    ]
+
+    def __init__(self, watcher: "AgentWatcher") -> None:
+        self._watcher = watcher
+        self._seen_lines: set[str] = set()
+        super().__init__()
+
+    def on_modified(self, event: FileModifiedEvent) -> None:  # type: ignore[override]
+        if event.is_directory:
+            return
+
+        path = Path(event.src_path)
+        if not path.suffix in (".log", ".jsonl"):
+            return
+
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+            for line in content.splitlines():
+                if line in self._seen_lines:
+                    continue
+                self._seen_lines.add(line)
+
+                for pattern in self.INSTALL_PATTERNS:
+                    match = re.search(pattern, line)
+                    if match:
+                        pkg_name = match.group(1)
+                        ecosystem = "npm" if "npm" in pattern or "yarn" in pattern else "pypi"
+                        self._watcher._queue_analysis(
+                            pkg_name, ecosystem, "claude-code:log"
+                        )
+        except OSError:
+            pass
+
+
 class AgentWatcher:
     """
     Main watcher orchestrator.
 
-    Runs two detection loops in parallel threads:
+    Runs detection loops in parallel threads:
       1. Process monitor — scans running processes every second
       2. File watcher   — uses watchdog for instant file change events
+      3. Agent-specific  — Claude Code log watcher, Copilot git hooks
 
     All detected installs are queued and analyzed asynchronously
     so the monitoring loop never blocks.
@@ -210,6 +300,8 @@ class AgentWatcher:
         block: bool,
         display: Display,
         reporter: SessionReporter,
+        aal: float = 0.5,
+        deep: bool = False,
     ) -> None:
         self.project_path = project_path
         self.agent = agent
@@ -218,14 +310,16 @@ class AgentWatcher:
         self.display = display
         self.reporter = reporter
 
-        self.analyzer = SupplyChainAnalyzer()
+        self.analyzer = SupplyChainAnalyzer(aal=aal, deep=deep)
         self._seen_pids: set[int] = set()
         self._analyzed: set[str] = set()  # "ecosystem:pkg" already analyzed
         self._lock = threading.Lock()
         self._running = False
+        self._git_hook_installed = False
+        self._claude_observer: Optional[Observer] = None
 
     def start(self) -> None:
-        """Start both watchers and block until interrupted."""
+        """Start all watchers and block until interrupted."""
         self._running = True
 
         # Snapshot existing dep files before starting
@@ -245,17 +339,80 @@ class AgentWatcher:
         )
         process_thread.start()
 
+        # Agent-specific setup
+        self._setup_agent_specific()
+
         self.display.watching(self.project_path, self.agent, self.threshold)
 
         try:
             while self._running:
                 time.sleep(0.5)
         finally:
+            self._teardown_agent_specific()
             observer.stop()
             observer.join()
 
     def stop(self) -> None:
         self._running = False
+
+    def _setup_agent_specific(self) -> None:
+        """Set up agent-specific interception methods."""
+        if self.agent == "claude-code":
+            self._start_claude_code_watcher()
+        elif self.agent == "copilot":
+            self._install_git_hook()
+
+    def _teardown_agent_specific(self) -> None:
+        """Clean up agent-specific resources."""
+        if self._claude_observer:
+            self._claude_observer.stop()
+            self._claude_observer.join()
+            self._claude_observer = None
+        if self._git_hook_installed:
+            self._remove_git_hook()
+
+    def _start_claude_code_watcher(self) -> None:
+        """Watch ~/.claude/ for MCP-related log files."""
+        claude_dir = Path.home() / ".claude"
+        if not claude_dir.exists():
+            return
+
+        handler = ClaudeCodeLogHandler(self)
+        self._claude_observer = Observer()
+        self._claude_observer.schedule(handler, str(claude_dir), recursive=True)
+        self._claude_observer.start()
+
+    def _install_git_hook(self) -> None:
+        """Install a .git/hooks/pre-commit script for Copilot integration."""
+        git_dir = self.project_path / ".git"
+        if not git_dir.exists():
+            return
+
+        hooks_dir = git_dir / "hooks"
+        hooks_dir.mkdir(exist_ok=True)
+        hook_path = hooks_dir / "pre-commit"
+
+        # Don't overwrite existing hooks
+        if hook_path.exists():
+            content = hook_path.read_text(encoding="utf-8", errors="ignore")
+            if "managed by uast" not in content:
+                return  # User has their own hook
+
+        hook_path.write_text(GIT_HOOK_SCRIPT, encoding="utf-8")
+        hook_path.chmod(0o755)
+        self._git_hook_installed = True
+
+    def _remove_git_hook(self) -> None:
+        """Remove the uast-managed git hook."""
+        hook_path = self.project_path / ".git" / "hooks" / "pre-commit"
+        if hook_path.exists():
+            try:
+                content = hook_path.read_text(encoding="utf-8", errors="ignore")
+                if "managed by uast" in content:
+                    hook_path.unlink()
+            except OSError:
+                pass
+        self._git_hook_installed = False
 
     def _process_monitor_loop(self) -> None:
         """Continuously scan running processes for pip/npm install commands."""
@@ -378,15 +535,16 @@ class AgentWatcher:
         self.reporter.add_result(result, source)
 
         # If blocking mode is on and score exceeds threshold, attempt to
-        # kill the install process (best-effort — process may already be done)
+        # kill the install process, then rollback if needed
         if self.block and result.ars_score >= self.threshold:
-            self._attempt_block(package_name)
+            blocked = self._attempt_block(package_name)
+            if not blocked:
+                self._rollback_install(package_name, ecosystem)
 
-    def _attempt_block(self, package_name: str) -> None:
+    def _attempt_block(self, package_name: str) -> bool:
         """
         Best-effort attempt to kill an in-progress install process.
-        This is inherently racy — a fast install may already be complete.
-        Future versions will use LD_PRELOAD / kernel hooks for reliable blocking.
+        Returns True if a process was found and killed.
         """
         for proc in psutil.process_iter(["pid", "cmdline"]):
             try:
@@ -396,6 +554,30 @@ class AgentWatcher:
                 ):
                     proc.kill()
                     self.display.blocked(package_name)
-                    break
+                    return True
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
+        return False
+
+    def _rollback_install(self, package_name: str, ecosystem: str) -> None:
+        """
+        Fallback: if the install process already completed before we could
+        kill it, uninstall the package to roll back the change.
+        """
+        try:
+            if ecosystem == "pypi":
+                subprocess.run(
+                    ["pip", "uninstall", "-y", package_name],
+                    capture_output=True,
+                    timeout=30,
+                )
+            else:
+                subprocess.run(
+                    ["npm", "uninstall", package_name],
+                    capture_output=True,
+                    timeout=30,
+                    cwd=str(self.project_path),
+                )
+            self.display.rolled_back(package_name)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
