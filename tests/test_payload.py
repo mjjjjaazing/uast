@@ -316,8 +316,13 @@ class TestPayloadAnalyzer:
             os.makedirs(extract_dir)
             result = analyzer._extract_archive(tar_path, extract_dir)
             assert result is True
-            # The traversal file should NOT be extracted
-            assert not os.path.exists(os.path.join(extract_dir, "..", "..", "..", "etc", "passwd"))
+            # The traversal file should NOT be written inside extract_dir
+            # (We can't check the ".." path literally — /etc/passwd exists on Linux)
+            extracted_files = []
+            for root, dirs, files in os.walk(extract_dir):
+                for f in files:
+                    extracted_files.append(os.path.join(root, f))
+            assert len(extracted_files) == 0, f"Path traversal file was extracted: {extracted_files}"
 
     def test_download_package_failure(self):
         from unittest.mock import patch
