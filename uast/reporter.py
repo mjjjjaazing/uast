@@ -4,7 +4,7 @@ SessionReporter — writes JSON session reports to disk.
 Every uast session produces a structured JSON report at
 ~/.uast/sessions/<timestamp>.json (or a user-specified path).
 
-Report schema v2 adds ARSM dimensions and dependency tree summary.
+Report schema v3 adds provenance, version diff, and Merkle tree hash fields.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from uast.analyzer import AnalysisResult
 class SessionReporter:
     """Accumulates analysis results and writes the final JSON report."""
 
-    REPORT_VERSION = "2"
+    REPORT_VERSION = "3"
 
     def __init__(
         self,
@@ -59,6 +59,9 @@ class SessionReporter:
             "metadata": result.metadata,
             "arsm": result.arsm,
             "did_you_mean": result.did_you_mean,
+            "dependency_tree_hash": getattr(result, "dependency_tree_hash", None),
+            "provenance": getattr(result, "provenance", None),
+            "version_diff": getattr(result, "version_diff", None),
         }
         self._results.append(entry)
 

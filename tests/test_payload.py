@@ -256,7 +256,7 @@ class TestPayloadAnalyzer:
         import os
         import tarfile
         import tempfile
-        analyzer = PayloadAnalyzer()
+        from uast.package_utils import extract_archive
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create a .tar.gz with a Python file
             src_dir = os.path.join(tmpdir, "src")
@@ -268,7 +268,7 @@ class TestPayloadAnalyzer:
                 tf.add(os.path.join(src_dir, "mod.py"), arcname="pkg/mod.py")
             extract_dir = os.path.join(tmpdir, "extracted")
             os.makedirs(extract_dir)
-            result = analyzer._extract_archive(tar_path, extract_dir)
+            result = extract_archive(tar_path, extract_dir)
             assert result is True
             assert os.path.exists(os.path.join(extract_dir, "pkg", "mod.py"))
 
@@ -276,34 +276,34 @@ class TestPayloadAnalyzer:
         import os
         import zipfile
         import tempfile
-        analyzer = PayloadAnalyzer()
+        from uast.package_utils import extract_archive
         with tempfile.TemporaryDirectory() as tmpdir:
             zip_path = os.path.join(tmpdir, "pkg.zip")
             with zipfile.ZipFile(zip_path, "w") as zf:
                 zf.writestr("pkg/mod.py", "print('hello')\n")
             extract_dir = os.path.join(tmpdir, "extracted")
             os.makedirs(extract_dir)
-            result = analyzer._extract_archive(zip_path, extract_dir)
+            result = extract_archive(zip_path, extract_dir)
             assert result is True
 
     def test_extract_archive_bad_file(self):
         import os
         import tempfile
-        analyzer = PayloadAnalyzer()
+        from uast.package_utils import extract_archive
         with tempfile.TemporaryDirectory() as tmpdir:
             bad_path = os.path.join(tmpdir, "bad.tar.gz")
             with open(bad_path, "w") as f:
                 f.write("not a tar file")
             extract_dir = os.path.join(tmpdir, "extracted")
             os.makedirs(extract_dir)
-            result = analyzer._extract_archive(bad_path, extract_dir)
+            result = extract_archive(bad_path, extract_dir)
             assert result is False
 
     def test_extract_archive_path_traversal_blocked(self):
         import os
         import tarfile
         import tempfile
-        analyzer = PayloadAnalyzer()
+        from uast.package_utils import extract_archive
         with tempfile.TemporaryDirectory() as tmpdir:
             tar_path = os.path.join(tmpdir, "evil.tar.gz")
             with tarfile.open(tar_path, "w:gz") as tf:
@@ -314,10 +314,9 @@ class TestPayloadAnalyzer:
                 tf.addfile(info, io.BytesIO(b"evil\n"))
             extract_dir = os.path.join(tmpdir, "extracted")
             os.makedirs(extract_dir)
-            result = analyzer._extract_archive(tar_path, extract_dir)
+            result = extract_archive(tar_path, extract_dir)
             assert result is True
             # The traversal file should NOT be written inside extract_dir
-            # (We can't check the ".." path literally — /etc/passwd exists on Linux)
             extracted_files = []
             for root, dirs, files in os.walk(extract_dir):
                 for f in files:
@@ -326,18 +325,18 @@ class TestPayloadAnalyzer:
 
     def test_download_package_failure(self):
         from unittest.mock import patch
-        analyzer = PayloadAnalyzer()
-        with patch("subprocess.run") as mock_run:
+        from uast.package_utils import download_package
+        with patch("uast.package_utils.subprocess.run") as mock_run:
             mock_run.return_value = type("R", (), {"returncode": 1})()
-            result = analyzer._download_package("nonexistent-pkg", None, "/tmp/test")
+            result = download_package("nonexistent-pkg", None, "/tmp/test")
             assert result is None
 
     def test_download_package_timeout(self):
         import subprocess
         from unittest.mock import patch
-        analyzer = PayloadAnalyzer()
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("pip", 60)):
-            result = analyzer._download_package("slow-pkg", "1.0", "/tmp/test")
+        from uast.package_utils import download_package
+        with patch("uast.package_utils.subprocess.run", side_effect=subprocess.TimeoutExpired("pip", 60)):
+            result = download_package("slow-pkg", "1.0", "/tmp/test")
             assert result is None
 
 

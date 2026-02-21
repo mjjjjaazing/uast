@@ -42,7 +42,7 @@ def print_banner(agent: str, project: str, version: str = "0.1.0") -> None:
 
 
 @click.group()
-@click.version_option(version="0.1.0", prog_name="uast")
+@click.version_option(version="0.4.0", prog_name="uast")
 def cli() -> None:
     """UAST — Unified Agentic Security Testing.
 
@@ -121,6 +121,12 @@ def cli() -> None:
     default=False,
     help="Suppress all log output to the console (file logging still active).",
 )
+@click.option(
+    "--provenance",
+    is_flag=True,
+    default=False,
+    help="Enable provenance verification (git clone + build + hash comparison).",
+)
 def start(
     agent: str,
     project: str,
@@ -131,6 +137,7 @@ def start(
     deep: bool,
     log_level: str,
     quiet: bool,
+    provenance: bool,
 ) -> None:
     """Start monitoring an AI coding agent session.
 
@@ -189,6 +196,7 @@ def start(
         aal=aal,
         deep=deep,
         config=config,
+        provenance=provenance,
     )
 
     # Handle Ctrl+C gracefully
@@ -264,7 +272,16 @@ def sessions() -> None:
     default="WARNING",
     help="Log level for file and console logging.",
 )
-def check(package_name: str, ecosystem: str, json_output: bool, agent: str, log_level: str) -> None:
+@click.option(
+    "--provenance",
+    is_flag=True,
+    default=False,
+    help="Enable provenance verification (git clone + build + hash comparison).",
+)
+def check(
+    package_name: str, ecosystem: str, json_output: bool,
+    agent: str, log_level: str, provenance: bool,
+) -> None:
     """Manually check a single package against the supply chain analyzer.
 
     \b
@@ -282,7 +299,7 @@ def check(package_name: str, ecosystem: str, json_output: bool, agent: str, log_
     config = load_config(project_path=Path("."))
     aal = get_agent_aal(config, agent)
     display = Display(console)
-    analyzer = SupplyChainAnalyzer(aal=aal, deep=True, config=config)
+    analyzer = SupplyChainAnalyzer(aal=aal, deep=True, config=config, provenance=provenance)
 
     if not json_output:
         console.print(f"\n[dim]Analyzing [bold]{package_name}[/bold] ({ecosystem})...[/dim]")
@@ -347,6 +364,48 @@ def show_config(project: str) -> None:
     project_path = Path(project).resolve()
     config = load_config(project_path=project_path)
     console.print(json_mod.dumps(config, indent=2, default=str))
+
+
+@cli.command("diff-trees")
+@click.argument("session1", type=click.Path(exists=True))
+@click.argument("session2", type=click.Path(exists=True))
+def diff_trees(session1: str, session2: str) -> None:
+    """Compare dependency tree hashes between two session reports.
+
+    \b
+    Detects drift in the dependency tree between sessions.
+
+    \b
+    Example:
+      uast diff-trees session_a.json session_b.json
+    """
+    from uast.merkle import diff_tree_hashes, load_session_hash
+
+    display = Display(console)
+
+    hash1 = load_session_hash(session1)
+    hash2 = load_session_hash(session2)
+
+    if hash1 is None:
+        console.print(
+            f"\n[yellow]Warning:[/yellow] No dependency_tree_hash in {session1}.\n"
+            "[dim]Run analysis with v0.4.0+ to generate tree hashes.[/dim]\n"
+        )
+        return
+    if hash2 is None:
+        console.print(
+            f"\n[yellow]Warning:[/yellow] No dependency_tree_hash in {session2}.\n"
+            "[dim]Run analysis with v0.4.0+ to generate tree hashes.[/dim]\n"
+        )
+        return
+
+    result = diff_tree_hashes(
+        hash1, hash2,
+        label_a=Path(session1).name,
+        label_b=Path(session2).name,
+    )
+
+    display.show_tree_diff(result, Path(session1).name, Path(session2).name)
 
 
 if __name__ == "__main__":

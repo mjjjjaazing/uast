@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uast"
-version = "0.1.0"
+version = "0.4.0"
 description = "Real-time security monitoring for AI coding agents. Detects supply chain attacks, compromised dependencies, and suspicious agent behavior."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -36,6 +36,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov", "black", "ruff", "mypy"]
+provenance = [
+    "sigstore>=4.0; python_version>='3.10'",
+    "pypi-attestations>=0.0.20; python_version>='3.10'",
+]
 
 [project.urls]
 Homepage = "https://github.com/mjjjjaazing/uast"

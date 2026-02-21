@@ -111,6 +111,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "poll_interval": 1.0,
     },
 
+    # Provenance verification settings
+    "provenance": {
+        "enabled": False,
+        "clone_timeout": 60,
+        "build_timeout": 120,
+        "max_repo_size_mb": 100,
+    },
+
+    # Version diff settings
+    "version_diff": {
+        "enabled": True,
+        "timeout": 60,
+    },
+
     # Custom allowlists (user additions — merged with built-in)
     "allowlist": {
         "pypi": [],

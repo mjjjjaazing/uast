@@ -85,6 +85,9 @@ class AnalysisResult:
     dependency_tree: Optional[dict] = None  # dep tree summary
     did_you_mean: Optional[str] = None   # suggestion for hallucinated packages
     confidence: str = "high"             # "high", "medium", "low" — scoring confidence
+    dependency_tree_hash: Optional[str] = None  # Merkle root hash of dep tree
+    provenance: Optional[dict] = None    # provenance verification results
+    version_diff: Optional[dict] = None  # version diff results
 
     @property
     def is_flagged(self) -> bool:
@@ -222,15 +225,16 @@ class SupplyChainAnalyzer:
 
     # Signal weights (sum to 1.0)
     WEIGHTS = {
-        "age_velocity":   0.20,
-        "name_squatting": 0.16,
-        "pattern_match":  0.06,
-        "metadata":       0.06,
+        "age_velocity":   0.18,
+        "name_squatting": 0.14,
+        "pattern_match":  0.05,
+        "metadata":       0.05,
         "depth":          0.08,
-        "payload":        0.20,
+        "payload":        0.18,
         "injection":      0.10,
-        "trust":          0.08,
-        "spoofing":       0.06,
+        "trust":          0.07,
+        "spoofing":       0.05,
+        "provenance":     0.10,
     }
 
     def __init__(
@@ -238,9 +242,11 @@ class SupplyChainAnalyzer:
         aal: float = 0.5,
         deep: bool = False,
         config: Optional[dict] = None,
+        provenance: bool = False,
     ) -> None:
         self.aal = aal
         self.deep = deep
+        self.provenance = provenance
         self.config = config or DEFAULT_CONFIG
         self._resolver = None  # Lazy import to avoid circular
 
@@ -432,6 +438,32 @@ class SupplyChainAnalyzer:
             result.signals.append(spoof_signal)
         raw_score += spoof_contribution * self.WEIGHTS["spoofing"]
 
+        # -- Signal 10: Provenance verification --------------------------------
+        provenance_contribution = 0.0
+        if self.provenance:
+            prov_signals = self._check_provenance(
+                package_name, result.version, info
+            )
+            for s in prov_signals:
+                result.signals.append(s)
+                if s.score_contribution > 0:
+                    provenance_contribution = max(
+                        provenance_contribution, s.score_contribution
+                    )
+                elif s.score_contribution < 0:
+                    # Negative contribution lowers risk
+                    provenance_contribution = min(
+                        provenance_contribution, s.score_contribution
+                    )
+        raw_score += max(provenance_contribution, 0.0) * self.WEIGHTS["provenance"]
+
+        # -- Version diff (deep mode) -----------------------------------------
+        if self.deep and result.version != "unknown":
+            vdiff_signals = self._check_version_diff(package_name, result.version)
+            for s in vdiff_signals:
+                result.signals.append(s)
+                raw_score += s.score_contribution * self.WEIGHTS["payload"] * 0.3
+
         # -- Compute ARSM score -----------------------------------------------
         result.cvss_base = round(min(raw_score * 10.0, 10.0), 1)
 
@@ -439,7 +471,7 @@ class SupplyChainAnalyzer:
         arsm_ctx = ARSMContext(
             aal=self.aal,
             cis=cis,
-            pc=self._estimate_provenance_confidence(info),
+            pc=self._estimate_provenance_confidence(info, result.signals),
             srf=self._estimate_systemic_replication(package_name, "pypi"),
         )
         result.ars_score = round(self._compute_arsm(result.cvss_base, arsm_ctx), 1)
@@ -682,8 +714,10 @@ class SupplyChainAnalyzer:
         )
         return ars
 
-    def _estimate_provenance_confidence(self, info: dict) -> float:
-        """Estimate Provenance Confidence (0-1) from PyPI metadata."""
+    def _estimate_provenance_confidence(
+        self, info: dict, signals: Optional[list[PackageSignal]] = None
+    ) -> float:
+        """Estimate Provenance Confidence (0-1) from PyPI metadata and signals."""
         score = 0.0
         checks = 0
 
@@ -715,7 +749,21 @@ class SupplyChainAnalyzer:
         # (We don't have releases here; give benefit of doubt)
         score += 0.5
 
-        return score / checks if checks > 0 else 0.5
+        base_pc = score / checks if checks > 0 else 0.5
+
+        # Adjust based on provenance/attestation signals
+        if signals:
+            signal_ids = {s.signal_id for s in signals}
+            if "PROV-003" in signal_ids:
+                base_pc = min(base_pc + 0.3, 1.0)
+            if "SIG-001" in signal_ids:
+                base_pc = min(base_pc + 0.2, 1.0)
+            if "SIG-003" in signal_ids:
+                base_pc = max(base_pc - 0.5, 0.0)
+            if "PROV-001" in signal_ids:
+                base_pc = max(base_pc - 0.4, 0.0)
+
+        return base_pc
 
     def _estimate_provenance_confidence_npm(self, data: dict) -> float:
         """Estimate Provenance Confidence (0-1) from npm metadata."""
@@ -1562,6 +1610,62 @@ class SupplyChainAnalyzer:
 
         return None, 0.0
 
+    # -- Provenance & version diff checks -----------------------------------
+
+    def _check_provenance(
+        self, package_name: str, version: str, info: dict
+    ) -> list[PackageSignal]:
+        """Run provenance verification on a package."""
+        try:
+            from uast.provenance import ProvenanceVerifier
+
+            prov_cfg = self.config.get("provenance", {})
+            verifier = ProvenanceVerifier(
+                clone_timeout=prov_cfg.get("clone_timeout", 60),
+                build_timeout=prov_cfg.get("build_timeout", 120),
+                max_repo_size_mb=prov_cfg.get("max_repo_size_mb", 100),
+            )
+
+            prov_result, signals = verifier.verify_source(
+                package_name, version, info=info,
+            )
+
+            # Store provenance result on the analysis result (via metadata)
+            # Will be attached by the caller
+            self._last_provenance = prov_result
+
+            # Also check attestations
+            attestation_status, att_signals = verifier.check_attestation(
+                package_name, version,
+            )
+            signals.extend(att_signals)
+
+            if prov_result:
+                prov_result.attestation = attestation_status
+
+            return signals
+        except Exception as e:
+            logger.warning("Provenance check failed for %s: %s", package_name, e)
+            return []
+
+    def _check_version_diff(
+        self, package_name: str, version: str
+    ) -> list[PackageSignal]:
+        """Run version diff check on a package."""
+        try:
+            from uast.version_diff import VersionDiffer, diff_to_signals
+
+            differ = VersionDiffer()
+            diff_result = differ.diff_versions(package_name, version)
+
+            # Store for report
+            self._last_version_diff = diff_result
+
+            return diff_to_signals(diff_result)
+        except Exception as e:
+            logger.debug("Version diff failed for %s: %s", package_name, e)
+            return []
+
     # -- Legacy compat method (used by tests) ---------------------------------
 
     def _check_dependency_depth(
@@ -1612,6 +1716,9 @@ class SupplyChainAnalyzer:
         has_scope = any("SCOPE" in s.signal_id for s in signals)
         has_spoof = any("SPOOF" in s.signal_id for s in signals)
         has_maintainer = any("MAINTAINER" in s.signal_id for s in signals)
+        has_prov_fail = any(
+            s.signal_id in ("PROV-001", "SIG-003") for s in signals
+        )
 
         if has_inject or has_poison:
             avt_classes.append("AVT-D1-01")
@@ -1629,6 +1736,8 @@ class SupplyChainAnalyzer:
             avt_classes.append("AVT-D3-04")
         if has_payload:
             avt_classes.append("AVT-D3-02")
+        if has_prov_fail:
+            avt_classes.append("AVT-D3-05")
 
         # Deduplicate
         avt_classes = list(dict.fromkeys(avt_classes))

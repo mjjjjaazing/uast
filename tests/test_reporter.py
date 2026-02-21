@@ -63,14 +63,14 @@ class TestSessionReporter:
             path = reporter.save()
             assert path.exists()
 
-    def test_report_schema_v2(self):
+    def test_report_schema_v3(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             reporter = self._make_reporter(tmpdir)
             reporter.save()
             with open(reporter.output_path) as f:
                 data = json.load(f)
 
-            assert data["version"] == "2"
+            assert data["version"] == "3"
             assert data["agent"] == "cursor"
             assert data["project"] == "/test/project"
             assert "started_at" in data

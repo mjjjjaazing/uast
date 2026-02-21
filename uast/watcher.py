@@ -315,6 +315,7 @@ class AgentWatcher:
         aal: float = 0.5,
         deep: bool = False,
         config: Optional[dict] = None,
+        provenance: bool = False,
     ) -> None:
         self.project_path = project_path
         self.agent = agent
@@ -327,7 +328,9 @@ class AgentWatcher:
         watcher_cfg = get_watcher_config(self.config)
         self.PROCESS_POLL_INTERVAL = watcher_cfg.get("poll_interval", 1.0)
 
-        self.analyzer = SupplyChainAnalyzer(aal=aal, deep=deep, config=self.config)
+        self.analyzer = SupplyChainAnalyzer(
+            aal=aal, deep=deep, config=self.config, provenance=provenance,
+        )
         self._seen_pids: dict[int, str] = {}  # pid → package_name
         self._analyzed: set[str] = set()  # "ecosystem:pkg" already analyzed
         self._lock = threading.Lock()

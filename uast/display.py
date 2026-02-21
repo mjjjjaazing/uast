@@ -50,7 +50,7 @@ class Display:
 
     # -- Startup --------------------------------------------------------------
 
-    def banner(self, agent: str, project: str, version: str = "0.1.0") -> None:
+    def banner(self, agent: str, project: str, version: str = "0.4.0") -> None:
         self.console.print()
         self.console.print(
             "[bold]UAST[/bold]  [dim]Unified Agentic Security Testing[/dim]"
@@ -306,6 +306,31 @@ class Display:
                 )
                 self.console.print()
 
+        # Provenance info
+        if result.provenance:
+            self.console.print()
+            self.console.print("  [dim]Provenance Verification[/dim]")
+            prov = result.provenance
+            prov_table = Table.grid(padding=(0, 2))
+            prov_table.add_column(style="dim", min_width=20)
+            prov_table.add_column()
+
+            verified = prov.get("source_verified", False)
+            method = prov.get("verification_method", "none")
+            attestation = prov.get("attestation", "none")
+
+            color = "green" if verified else "yellow"
+            prov_table.add_row(
+                "Source Verified",
+                f"[{color}]{'Yes' if verified else 'No'}[/{color}]",
+            )
+            prov_table.add_row("Method", method)
+            prov_table.add_row("Attestation", attestation or "none")
+
+            self.console.print(
+                Panel(prov_table, border_style="dim", padding=(0, 2))
+            )
+
         # Recommendation
         self.console.print(
             f"  [bold]→[/bold]  {result.recommendation}"
@@ -348,6 +373,36 @@ class Display:
 
         self.console.print()
         self.console.print(table)
+        self.console.print()
+
+    # -- Tree diff display ----------------------------------------------------
+
+    def show_tree_diff(self, diff: dict, label_a: str, label_b: str) -> None:
+        """Display the result of a dependency tree hash comparison."""
+        self.console.print()
+
+        if diff["match"]:
+            self.console.print(
+                "  [green]✓[/green]  [bold]Dependency trees match[/bold]  "
+                "[dim]— no drift detected[/dim]"
+            )
+        else:
+            self.console.print(
+                "  [red]✗[/red]  [bold red]Dependency tree drift detected[/bold red]"
+            )
+
+        self.console.print()
+
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="dim", min_width=16)
+        table.add_column()
+
+        table.add_row(label_a, f"[dim]{diff.get(label_a, 'N/A')[:16]}...[/dim]")
+        table.add_row(label_b, f"[dim]{diff.get(label_b, 'N/A')[:16]}...[/dim]")
+
+        self.console.print(
+            Panel(table, title="[dim]Tree Hash Comparison[/dim]", border_style="dim")
+        )
         self.console.print()
 
     # -- Report display -------------------------------------------------------

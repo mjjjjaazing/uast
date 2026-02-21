@@ -20,15 +20,12 @@ import ast
 import logging
 import os
 import re
-import subprocess
-import sys
-import tarfile
 import tempfile
-import zipfile
 from dataclasses import dataclass
 from typing import Optional
 
 from uast.analyzer import PackageSignal
+from uast.package_utils import download_package, extract_archive
 
 logger = logging.getLogger("uast.payload")
 
@@ -568,7 +565,7 @@ class PayloadAnalyzer:
             return []  # Only Python packages supported for now
 
         with tempfile.TemporaryDirectory(prefix="uast_payload_") as tmpdir:
-            pkg_path = self._download_package(name, version, tmpdir)
+            pkg_path = download_package(name, version, tmpdir, sdist_only=True)
             if not pkg_path:
                 logger.warning("Failed to download package %s for payload analysis", name)
                 return []
@@ -576,88 +573,13 @@ class PayloadAnalyzer:
             extract_dir = os.path.join(tmpdir, "extracted")
             os.makedirs(extract_dir, exist_ok=True)
 
-            if not self._extract_archive(pkg_path, extract_dir):
+            if not extract_archive(pkg_path, extract_dir):
                 logger.warning("Failed to extract package %s", name)
                 return []
 
             findings = self._analyze_python_files(extract_dir)
             logger.info("Payload analysis complete: %s → %d findings", name, len(findings))
             return self._findings_to_signals(findings)
-
-    def _download_package(
-        self, name: str, version: Optional[str], dest_dir: str
-    ) -> Optional[str]:
-        """Download package sdist/wheel using pip download."""
-        cmd = [
-            sys.executable, "-m", "pip", "download",
-            "--no-deps",
-            "--no-binary", ":all:",  # Prefer sdist for source
-            "-d", dest_dir,
-        ]
-        if version:
-            cmd.append(f"{name}=={version}")
-        else:
-            cmd.append(name)
-
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            if result.returncode != 0:
-                # Fall back to allowing binary (wheel)
-                cmd_wheel = [
-                    sys.executable, "-m", "pip", "download",
-                    "--no-deps",
-                    "-d", dest_dir,
-                ]
-                if version:
-                    cmd_wheel.append(f"{name}=={version}")
-                else:
-                    cmd_wheel.append(name)
-                result = subprocess.run(
-                    cmd_wheel,
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-                if result.returncode != 0:
-                    return None
-        except (subprocess.TimeoutExpired, OSError):
-            return None
-
-        # Find downloaded file
-        for f in os.listdir(dest_dir):
-            if f.endswith((".tar.gz", ".zip", ".whl", ".tar.bz2")):
-                return os.path.join(dest_dir, f)
-        return None
-
-    def _extract_archive(self, path: str, dest: str) -> bool:
-        """Extract a .tar.gz, .tar.bz2, .zip, or .whl to dest."""
-        try:
-            if path.endswith((".tar.gz", ".tar.bz2")):
-                with tarfile.open(path) as tf:
-                    # Security: filter out absolute paths and path traversal
-                    members = []
-                    for m in tf.getmembers():
-                        if m.name.startswith("/") or ".." in m.name:
-                            continue
-                        members.append(m)
-                    tf.extractall(dest, members=members)
-                return True
-            elif path.endswith((".zip", ".whl")):
-                with zipfile.ZipFile(path) as zf:
-                    # Security: filter out absolute paths and path traversal
-                    for info in zf.infolist():
-                        if info.filename.startswith("/") or ".." in info.filename:
-                            continue
-                        zf.extract(info, dest)
-                return True
-        except (tarfile.TarError, zipfile.BadZipFile, OSError):
-            pass
-        return False
 
     def _analyze_python_files(self, directory: str) -> list[PayloadFinding]:
         """Walk all .py files and run AST visitor on each."""
