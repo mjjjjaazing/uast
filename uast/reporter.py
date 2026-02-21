@@ -100,6 +100,13 @@ class SessionReporter:
         with open(self.output_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
 
+        # Set file permissions to 0o600 (user-only read/write)
+        try:
+            import os, stat
+            os.chmod(str(self.output_path), stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass  # Best effort
+
         return self.output_path
 
     @property

@@ -247,7 +247,8 @@ class TestSupplyChainAnalyzer:
 
     @patch("uast.analyzer.http_client")
     def test_fetch_download_stats_failure(self, mock_client):
-        mock_client.get.side_effect = Exception("timeout")
+        import requests as req_lib
+        mock_client.get.side_effect = req_lib.ConnectionError("timeout")
         result = self.analyzer._fetch_download_stats("requests", "pypi")
         assert result is None
 

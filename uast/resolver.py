@@ -11,12 +11,15 @@ dependency metadata from PyPI / npm. Includes safety limits:
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Optional
 from difflib import SequenceMatcher
 
 import requests
+
+logger = logging.getLogger("uast.resolver")
 
 from uast.http_client import http_client
 from uast.analyzer import (
@@ -58,16 +61,23 @@ class DependencyResolver:
     PYPI_API = "https://pypi.org/pypi/{name}/json"
     NPM_API = "https://registry.npmjs.org/{name}"
 
-    MAX_DEPTH = 5
-    MAX_PACKAGES = 200
+    DEFAULT_MAX_DEPTH = 5
+    DEFAULT_MAX_PACKAGES = 200
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_depth: int = DEFAULT_MAX_DEPTH,
+        max_packages: int = DEFAULT_MAX_PACKAGES,
+    ) -> None:
+        self.MAX_DEPTH = max_depth
+        self.MAX_PACKAGES = max_packages
         self._memo: dict[str, list[str]] = {}  # name -> direct deps
         self._visited: set[str] = set()
         self._total_count = 0
 
     def resolve_tree(self, package_name: str, ecosystem: str) -> DependencyTree:
         """Build the full transitive dependency tree for a package."""
+        logger.info("Resolving dependency tree for %s (%s)", package_name, ecosystem)
         self._visited = set()
         self._total_count = 0
 
@@ -81,6 +91,10 @@ class DependencyResolver:
             tree.suspicious_packages = self._collect_suspicious(root_node)
             tree.truncated = self._total_count >= self.MAX_PACKAGES
 
+        logger.info(
+            "Dependency tree resolved: %s → %d packages, max depth %d, %d suspicious",
+            package_name, tree.total_count, tree.max_depth, len(tree.suspicious_packages),
+        )
         return tree
 
     def _resolve_node(
@@ -89,12 +103,15 @@ class DependencyResolver:
         """Recursively resolve a single dependency node."""
         # Safety limits
         if depth > self.MAX_DEPTH:
+            logger.debug("Max depth reached (%d) for %s", self.MAX_DEPTH, name)
             return None
         if self._total_count >= self.MAX_PACKAGES:
+            logger.debug("Max packages reached (%d) — stopping", self.MAX_PACKAGES)
             return None
 
         key = f"{ecosystem}:{name.lower()}"
         if key in self._visited:
+            logger.debug("Cycle detected: %s already visited", name)
             return None  # Cycle detected
         self._visited.add(key)
         self._total_count += 1

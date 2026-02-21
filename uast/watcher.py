@@ -18,6 +18,7 @@ Agent-specific:
 
 from __future__ import annotations
 
+import logging
 import re
 import os
 import time
@@ -26,11 +27,14 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+logger = logging.getLogger("uast.watcher")
+
 import psutil
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileModifiedEvent
 
 from uast.analyzer import SupplyChainAnalyzer, AnalysisResult
+from uast.config import DEFAULT_CONFIG, get_watcher_config
 from uast.display import Display
 from uast.reporter import SessionReporter
 
@@ -84,13 +88,18 @@ if ! command -v uast >/dev/null 2>&1; then
     exit 0
 fi
 
+# Validate package name: only allow safe characters
+validate_pkg_name() {
+    echo "$1" | grep -qE '^[a-zA-Z0-9@][a-zA-Z0-9._@/-]{0,213}$'
+}
+
 # Check requirements.txt changes
 for f in requirements.txt requirements-dev.txt; do
     if git diff --cached --name-only | grep -q "$f"; then
         ADDED=$(git diff --cached "$f" | grep '^+' | grep -v '^+++' | sed 's/^+//' | grep -v '^#' | grep -v '^-')
         for pkg in $ADDED; do
             PKG_NAME=$(echo "$pkg" | sed 's/[><=!~].*//')
-            if [ -n "$PKG_NAME" ]; then
+            if [ -n "$PKG_NAME" ] && validate_pkg_name "$PKG_NAME"; then
                 uast check "$PKG_NAME" --ecosystem pypi 2>/dev/null
             fi
         done
@@ -101,7 +110,7 @@ done
 if git diff --cached --name-only | grep -q "package.json"; then
     ADDED=$(git diff --cached package.json | grep '^+' | grep -v '^+++' | grep '"[^"]*":' | sed 's/.*"\\([^"]*\\)".*/\\1/')
     for pkg in $ADDED; do
-        if [ -n "$pkg" ] && [ "$pkg" != "dependencies" ] && [ "$pkg" != "devDependencies" ]; then
+        if [ -n "$pkg" ] && [ "$pkg" != "dependencies" ] && [ "$pkg" != "devDependencies" ] && validate_pkg_name "$pkg"; then
             uast check "$pkg" --ecosystem npm 2>/dev/null
         fi
     done
@@ -302,6 +311,7 @@ class AgentWatcher:
         reporter: SessionReporter,
         aal: float = 0.5,
         deep: bool = False,
+        config: Optional[dict] = None,
     ) -> None:
         self.project_path = project_path
         self.agent = agent
@@ -309,9 +319,13 @@ class AgentWatcher:
         self.block = block
         self.display = display
         self.reporter = reporter
+        self.config = config or DEFAULT_CONFIG
 
-        self.analyzer = SupplyChainAnalyzer(aal=aal, deep=deep)
-        self._seen_pids: set[int] = set()
+        watcher_cfg = get_watcher_config(self.config)
+        self.PROCESS_POLL_INTERVAL = watcher_cfg.get("poll_interval", 1.0)
+
+        self.analyzer = SupplyChainAnalyzer(aal=aal, deep=deep, config=self.config)
+        self._seen_pids: dict[int, str] = {}  # pid → package_name
         self._analyzed: set[str] = set()  # "ecosystem:pkg" already analyzed
         self._lock = threading.Lock()
         self._running = False
@@ -320,6 +334,7 @@ class AgentWatcher:
 
     def start(self) -> None:
         """Start all watchers and block until interrupted."""
+        logger.info("Starting watchers for agent=%s project=%s", self.agent, self.project_path)
         self._running = True
 
         # Snapshot existing dep files before starting
@@ -419,8 +434,8 @@ class AgentWatcher:
         while self._running:
             try:
                 self._scan_processes()
-            except Exception:
-                pass
+            except (psutil.Error, OSError) as e:
+                logger.debug("Process scan error: %s", e)
             time.sleep(self.PROCESS_POLL_INTERVAL)
 
     def _scan_processes(self) -> None:
@@ -441,16 +456,16 @@ class AgentWatcher:
 
                 # Detect pip installs
                 if self._is_pip_install(cmdline):
-                    self._seen_pids.add(pid)
                     packages = self._parse_pip_cmdline(cmdline)
                     for pkg_name in packages:
+                        self._seen_pids[pid] = pkg_name
                         self._queue_analysis(pkg_name, "pypi", "process:pip")
 
                 # Detect npm/yarn/pnpm installs
                 elif self._is_npm_install(cmdline):
-                    self._seen_pids.add(pid)
                     packages = self._parse_npm_cmdline(cmdline)
                     for pkg_name in packages:
+                        self._seen_pids[pid] = pkg_name
                         self._queue_analysis(pkg_name, "npm", "process:npm")
 
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
@@ -508,8 +523,11 @@ class AgentWatcher:
 
         with self._lock:
             if key in self._analyzed:
+                logger.debug("Already analyzed %s — skipping", key)
                 return
             self._analyzed.add(key)
+
+        logger.info("Queuing analysis: %s (%s) via %s", package_name, ecosystem, source)
 
         # Run analysis in a thread so we never block the monitor loop
         t = threading.Thread(
@@ -544,14 +562,15 @@ class AgentWatcher:
     def _attempt_block(self, package_name: str) -> bool:
         """
         Best-effort attempt to kill an in-progress install process.
+        Only kills processes that UAST previously tracked via _seen_pids.
         Returns True if a process was found and killed.
         """
-        for proc in psutil.process_iter(["pid", "cmdline"]):
+        for pid, tracked_pkg in list(self._seen_pids.items()):
+            if tracked_pkg.lower() != package_name.lower():
+                continue
             try:
-                cmdline = " ".join(proc.info["cmdline"] or [])
-                if package_name.lower() in cmdline.lower() and (
-                    "pip" in cmdline or "npm" in cmdline
-                ):
+                proc = psutil.Process(pid)
+                if proc.is_running():
                     proc.kill()
                     self.display.blocked(package_name)
                     return True

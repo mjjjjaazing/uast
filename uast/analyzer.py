@@ -20,6 +20,7 @@ Detection signals:
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import time
@@ -31,6 +32,19 @@ from difflib import SequenceMatcher
 import requests
 
 from uast.http_client import http_client
+from uast.config import (
+    DEFAULT_CONFIG,
+    get_age_thresholds,
+    get_allowlist,
+    get_arsm_coefficients,
+    get_blocklist,
+    get_dependency_config,
+    get_http_config,
+    get_similarity_thresholds,
+    get_velocity_config,
+)
+
+logger = logging.getLogger("uast.analyzer")
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -156,6 +170,35 @@ AGENT_AAL = {
 
 
 # ---------------------------------------------------------------------------
+# Input sanitization
+# ---------------------------------------------------------------------------
+
+# Valid package name pattern: alphanumeric, hyphens, underscores, dots, @, /
+# npm allows @scope/name, PyPI allows dots/hyphens/underscores
+_VALID_PACKAGE_NAME = re.compile(r"^[@a-zA-Z0-9][\w.@/\-]{0,213}$")
+MAX_PACKAGE_NAME_LENGTH = 214  # npm maximum
+
+
+def sanitize_package_name(name: str) -> str:
+    """
+    Validate and sanitize a package name.
+
+    Rejects names with shell metacharacters, control characters,
+    or names that exceed length limits.
+
+    Returns the stripped name if valid, raises ValueError if not.
+    """
+    name = name.strip()
+    if not name:
+        raise ValueError("Empty package name")
+    if len(name) > MAX_PACKAGE_NAME_LENGTH:
+        raise ValueError(f"Package name too long ({len(name)} chars, max {MAX_PACKAGE_NAME_LENGTH})")
+    if not _VALID_PACKAGE_NAME.match(name):
+        raise ValueError(f"Invalid package name: {name!r} — contains disallowed characters")
+    return name
+
+
+# ---------------------------------------------------------------------------
 # Analyzer
 # ---------------------------------------------------------------------------
 
@@ -185,15 +228,25 @@ class SupplyChainAnalyzer:
         "payload":        0.25,
     }
 
-    def __init__(self, aal: float = 0.5, deep: bool = False) -> None:
+    def __init__(
+        self,
+        aal: float = 0.5,
+        deep: bool = False,
+        config: Optional[dict] = None,
+    ) -> None:
         self.aal = aal
         self.deep = deep
+        self.config = config or DEFAULT_CONFIG
         self._resolver = None  # Lazy import to avoid circular
 
     def _get_resolver(self):
         if self._resolver is None:
             from uast.resolver import DependencyResolver
-            self._resolver = DependencyResolver()
+            resolver_cfg = self.config.get("resolver", DEFAULT_CONFIG["resolver"])
+            self._resolver = DependencyResolver(
+                max_depth=resolver_cfg.get("max_depth", 5),
+                max_packages=resolver_cfg.get("max_packages", 200),
+            )
         return self._resolver
 
     def _get_payload_analyzer(self):
@@ -202,6 +255,20 @@ class SupplyChainAnalyzer:
 
     def analyze_pypi(self, package_name: str) -> AnalysisResult:
         """Analyze a PyPI package and return an AnalysisResult."""
+        try:
+            package_name = sanitize_package_name(package_name)
+        except ValueError as e:
+            logger.warning("Invalid package name rejected: %s", e)
+            return AnalysisResult(
+                package_name=package_name[:100],
+                ecosystem="pypi",
+                version="unknown",
+                ars_score=0.0,
+                cvss_base=0.0,
+                verdict="clean",
+                recommendation=f"Invalid package name: {e}",
+            )
+        logger.info("Analyzing PyPI package: %s", package_name)
         result = AnalysisResult(
             package_name=package_name,
             ecosystem="pypi",
@@ -210,8 +277,27 @@ class SupplyChainAnalyzer:
             cvss_base=0.0,
         )
 
-        # Fast path — known safe packages
-        if package_name.lower() in PYPI_SAFE:
+        # Check blocklist first — always flag regardless of allowlist
+        blocklist = get_blocklist(self.config, "pypi")
+        if package_name.lower() in blocklist:
+            logger.warning("Package %s is on the blocklist — returning critical", package_name)
+            result.signals.append(PackageSignal(
+                signal_id="BLOCK-001",
+                severity="critical",
+                title="Package is on the blocklist",
+                detail=f"{package_name} is explicitly blocklisted in UAST configuration.",
+                score_contribution=1.0,
+            ))
+            result.ars_score = 10.0
+            result.verdict = "critical"
+            result.avt_classes = ["AVT-D3-01"]
+            result.recommendation = "Do not install. Package is blocklisted by your organization."
+            return result
+
+        # Fast path — known safe packages (built-in + user allowlist)
+        user_allowlist = get_allowlist(self.config, "pypi")
+        if package_name.lower() in PYPI_SAFE or package_name.lower() in user_allowlist:
+            logger.debug("Package %s is in allowlist — skipping analysis", package_name)
             result.verdict = "clean"
             result.recommendation = "Package is in the known-safe allowlist."
             result.signals.append(PackageSignal(
@@ -225,17 +311,21 @@ class SupplyChainAnalyzer:
 
         # Fetch PyPI metadata
         try:
+            logger.debug("Fetching PyPI metadata for %s", package_name)
             resp = http_client.get(
                 self.PYPI_API.format(name=package_name),
                 timeout=self.REQUEST_TIMEOUT,
             )
             if resp.status_code == 404:
+                logger.info("Package %s not found on PyPI (404)", package_name)
                 return self._handle_hallucinated_package(result, package_name, "pypi")
 
             resp.raise_for_status()
             data = resp.json()
+            logger.debug("PyPI metadata fetched for %s (status %d)", package_name, resp.status_code)
 
         except requests.RequestException as e:
+            logger.warning("Network error fetching PyPI data for %s: %s", package_name, e)
             result.signals.append(PackageSignal(
                 signal_id="NET-001",
                 severity="low",
@@ -315,15 +405,16 @@ class SupplyChainAnalyzer:
             srf=self._estimate_systemic_replication(package_name, "pypi"),
         )
         result.ars_score = round(self._compute_arsm(result.cvss_base, arsm_ctx), 1)
+        coeff = get_arsm_coefficients(self.config)
         result.arsm = {
             "aal": arsm_ctx.aal,
             "cis": arsm_ctx.cis,
             "pc": arsm_ctx.pc,
             "srf": round(arsm_ctx.srf, 2),
-            "alpha": ARSM_ALPHA,
-            "beta": ARSM_BETA,
-            "gamma": ARSM_GAMMA,
-            "delta": ARSM_DELTA,
+            "alpha": coeff.get("alpha", 0.30),
+            "beta": coeff.get("beta", 0.25),
+            "gamma": coeff.get("gamma", 0.25),
+            "delta": coeff.get("delta", 0.20),
         }
 
         # Set verdict and AVT classes
@@ -331,10 +422,28 @@ class SupplyChainAnalyzer:
             self._compute_verdict(result.ars_score, result.signals)
         )
 
+        logger.info(
+            "PyPI analysis complete: %s → ARS=%.1f verdict=%s signals=%d",
+            package_name, result.ars_score, result.verdict, len(result.signals),
+        )
         return result
 
     def analyze_npm(self, package_name: str) -> AnalysisResult:
         """Analyze an npm package and return an AnalysisResult."""
+        try:
+            package_name = sanitize_package_name(package_name)
+        except ValueError as e:
+            logger.warning("Invalid package name rejected: %s", e)
+            return AnalysisResult(
+                package_name=package_name[:100],
+                ecosystem="npm",
+                version="unknown",
+                ars_score=0.0,
+                cvss_base=0.0,
+                verdict="clean",
+                recommendation=f"Invalid package name: {e}",
+            )
+        logger.info("Analyzing npm package: %s", package_name)
         result = AnalysisResult(
             package_name=package_name,
             ecosystem="npm",
@@ -343,7 +452,24 @@ class SupplyChainAnalyzer:
             cvss_base=0.0,
         )
 
-        if package_name.lower() in NPM_SAFE:
+        # Check blocklist first
+        blocklist = get_blocklist(self.config, "npm")
+        if package_name.lower() in blocklist:
+            result.signals.append(PackageSignal(
+                signal_id="BLOCK-001",
+                severity="critical",
+                title="Package is on the blocklist",
+                detail=f"{package_name} is explicitly blocklisted in UAST configuration.",
+                score_contribution=1.0,
+            ))
+            result.ars_score = 10.0
+            result.verdict = "critical"
+            result.avt_classes = ["AVT-D3-01"]
+            result.recommendation = "Do not install. Package is blocklisted by your organization."
+            return result
+
+        user_allowlist = get_allowlist(self.config, "npm")
+        if package_name.lower() in NPM_SAFE or package_name.lower() in user_allowlist:
             result.verdict = "clean"
             result.recommendation = "Package is in the known-safe allowlist."
             result.signals.append(PackageSignal(
@@ -439,21 +565,26 @@ class SupplyChainAnalyzer:
             srf=self._estimate_systemic_replication(package_name, "npm"),
         )
         result.ars_score = round(self._compute_arsm(result.cvss_base, arsm_ctx), 1)
+        coeff = get_arsm_coefficients(self.config)
         result.arsm = {
             "aal": arsm_ctx.aal,
             "cis": arsm_ctx.cis,
             "pc": arsm_ctx.pc,
             "srf": round(arsm_ctx.srf, 2),
-            "alpha": ARSM_ALPHA,
-            "beta": ARSM_BETA,
-            "gamma": ARSM_GAMMA,
-            "delta": ARSM_DELTA,
+            "alpha": coeff.get("alpha", 0.30),
+            "beta": coeff.get("beta", 0.25),
+            "gamma": coeff.get("gamma", 0.25),
+            "delta": coeff.get("delta", 0.20),
         }
 
         result.verdict, result.avt_classes, result.recommendation = (
             self._compute_verdict(result.ars_score, result.signals)
         )
 
+        logger.info(
+            "npm analysis complete: %s → ARS=%.1f verdict=%s signals=%d",
+            package_name, result.ars_score, result.verdict, len(result.signals),
+        )
         return result
 
     # -- ARSM computation -----------------------------------------------------
@@ -466,15 +597,26 @@ class SupplyChainAnalyzer:
         if cvss_base == 0.0:
             return 0.0
 
+        coeff = get_arsm_coefficients(self.config)
+        alpha = coeff.get("alpha", ARSM_ALPHA)
+        beta = coeff.get("beta", ARSM_BETA)
+        gamma = coeff.get("gamma", ARSM_GAMMA)
+        delta = coeff.get("delta", ARSM_DELTA)
+
         multiplier = (
             1.0
-            + ARSM_ALPHA * ctx.aal
-            + ARSM_BETA * (1.0 - ctx.cis)
-            + ARSM_GAMMA * (1.0 - ctx.pc)
-            + ARSM_DELTA * math.log(1.0 + ctx.srf)
+            + alpha * ctx.aal
+            + beta * (1.0 - ctx.cis)
+            + gamma * (1.0 - ctx.pc)
+            + delta * math.log(1.0 + ctx.srf)
         )
 
-        return min(cvss_base * multiplier, 10.0)
+        ars = min(cvss_base * multiplier, 10.0)
+        logger.debug(
+            "ARSM: base=%.1f multiplier=%.3f → ARS=%.1f (AAL=%.2f CIS=%.2f PC=%.2f SRF=%.2f)",
+            cvss_base, multiplier, ars, ctx.aal, ctx.cis, ctx.pc, ctx.srf,
+        )
+        return ars
 
     def _estimate_provenance_confidence(self, info: dict) -> float:
         """Estimate Provenance Confidence (0-1) from PyPI metadata."""
@@ -548,7 +690,8 @@ class SupplyChainAnalyzer:
                 return 0.0
             # Normalize: 1M+ downloads/week = SRF 1.0
             return min(downloads / 1_000_000.0, 5.0)
-        except Exception:
+        except (requests.RequestException, ValueError, KeyError) as e:
+            logger.debug("SRF estimation failed for %s: %s", name, e)
             return 0.0
 
     def _fetch_download_stats(self, name: str, ecosystem: str) -> Optional[int]:
@@ -570,8 +713,8 @@ class SupplyChainAnalyzer:
                 if resp.status_code == 200:
                     data = resp.json()
                     return data.get("downloads", None)
-        except Exception:
-            pass
+        except (requests.RequestException, ValueError, KeyError) as e:
+            logger.debug("Download stats fetch failed for %s: %s", name, e)
         return None
 
     # -- Hallucinated package detection ---------------------------------------
@@ -625,7 +768,9 @@ class SupplyChainAnalyzer:
                 best_ratio = ratio
                 best_match = candidate
 
-        if best_ratio >= 0.6 and best_match:
+        sim_cfg = get_similarity_thresholds(self.config)
+        suggest_threshold = sim_cfg.get("suggest", 0.60)
+        if best_ratio >= suggest_threshold and best_match:
             return best_match
         return None
 
@@ -657,15 +802,23 @@ class SupplyChainAnalyzer:
         age_days = (datetime.datetime.utcnow() - first_upload).days
 
         # Check download velocity for anomaly detection
+        vel_cfg = get_velocity_config(self.config)
+        age_cfg = get_age_thresholds(self.config)
+        critical_days = age_cfg.get("critical_days", 7)
+        warning_days = age_cfg.get("warning_days", 30)
+        notice_days = age_cfg.get("notice_days", 90)
+        anomaly_downloads = vel_cfg.get("anomaly_downloads", 10000)
+        age_window = vel_cfg.get("age_window_days", 30)
+
         velocity_note = ""
         downloads = self._fetch_download_stats(name, "pypi")
-        if downloads is not None and age_days < 30 and downloads > 10000:
+        if downloads is not None and age_days < age_window and downloads > anomaly_downloads:
             velocity_note = (
                 f" Anomalous download velocity: {downloads:,} downloads/week "
                 f"for a {age_days}-day-old package."
             )
 
-        if age_days < 7:
+        if age_days < critical_days:
             return PackageSignal(
                 signal_id="AGE-001",
                 severity="high",
@@ -679,7 +832,7 @@ class SupplyChainAnalyzer:
                 score_contribution=0.85,
             ), 0.85
 
-        if age_days < 30:
+        if age_days < warning_days:
             contribution = 0.55 if velocity_note else 0.45
             return PackageSignal(
                 signal_id="VEL-001" if velocity_note else "AGE-002",
@@ -693,7 +846,7 @@ class SupplyChainAnalyzer:
                 score_contribution=contribution,
             ), contribution
 
-        if age_days < 90:
+        if age_days < notice_days:
             return PackageSignal(
                 signal_id="AGE-003",
                 severity="low",
@@ -721,15 +874,22 @@ class SupplyChainAnalyzer:
 
         age_days = (datetime.datetime.utcnow() - created).days
 
+        vel_cfg = get_velocity_config(self.config)
+        age_cfg = get_age_thresholds(self.config)
+        critical_days = age_cfg.get("critical_days", 7)
+        warning_days = age_cfg.get("warning_days", 30)
+        anomaly_downloads = vel_cfg.get("anomaly_downloads", 10000)
+        age_window = vel_cfg.get("age_window_days", 30)
+
         velocity_note = ""
         downloads = self._fetch_download_stats(name, "npm")
-        if downloads is not None and age_days < 30 and downloads > 10000:
+        if downloads is not None and age_days < age_window and downloads > anomaly_downloads:
             velocity_note = (
                 f" Anomalous download velocity: {downloads:,} downloads/week "
                 f"for a {age_days}-day-old package."
             )
 
-        if age_days < 7:
+        if age_days < critical_days:
             return PackageSignal(
                 signal_id="AGE-001",
                 severity="high",
@@ -742,7 +902,7 @@ class SupplyChainAnalyzer:
                 score_contribution=0.85,
             ), 0.85
 
-        if age_days < 30:
+        if age_days < warning_days:
             contribution = 0.55 if velocity_note else 0.45
             return PackageSignal(
                 signal_id="VEL-001" if velocity_note else "AGE-002",
@@ -777,7 +937,11 @@ class SupplyChainAnalyzer:
                 best_ratio = ratio
                 best_match = popular_pkg
 
-        if best_ratio >= 0.85 and best_match:
+        sim_cfg = get_similarity_thresholds(self.config)
+        critical_threshold = sim_cfg.get("critical", 0.85)
+        high_threshold = sim_cfg.get("high", 0.70)
+
+        if best_ratio >= critical_threshold and best_match:
             return PackageSignal(
                 signal_id="SQUAT-001",
                 severity="critical",
@@ -790,7 +954,7 @@ class SupplyChainAnalyzer:
                 score_contribution=0.95,
             ), 0.95
 
-        if best_ratio >= 0.70 and best_match:
+        if best_ratio >= high_threshold and best_match:
             return PackageSignal(
                 signal_id="SQUAT-002",
                 severity="high",
@@ -915,7 +1079,8 @@ class SupplyChainAnalyzer:
         try:
             resp = http_client.head(url, timeout=5)
             return resp.status_code < 400
-        except Exception:
+        except (requests.RequestException, OSError) as e:
+            logger.debug("Repository URL verification failed for %s: %s", url, e)
             return True  # Network error — give benefit of doubt
 
     def _check_dependency_tree(
@@ -925,15 +1090,20 @@ class SupplyChainAnalyzer:
         signals: list[PackageSignal] = []
         max_contribution = 0.0
 
+        dep_cfg = get_dependency_config(self.config)
+        high_count = dep_cfg.get("high_count", 50)
+        elevated_count = dep_cfg.get("elevated_count", 25)
+        deep_chain = dep_cfg.get("deep_chain", 4)
+
         try:
             resolver = self._get_resolver()
             tree = resolver.resolve_tree(package_name, ecosystem)
 
-            if tree.dependency_tree:
+            if tree.nodes:
                 pass  # Store for display later
 
             # Check total transitive count
-            if tree.total_count > 50:
+            if tree.total_count > high_count:
                 sig = PackageSignal(
                     signal_id="DEPTH-001",
                     severity="medium",
@@ -947,7 +1117,7 @@ class SupplyChainAnalyzer:
                 signals.append(sig)
                 max_contribution = max(max_contribution, 0.5)
 
-            elif tree.total_count > 25:
+            elif tree.total_count > elevated_count:
                 sig = PackageSignal(
                     signal_id="DEPTH-002",
                     severity="low",
@@ -959,7 +1129,7 @@ class SupplyChainAnalyzer:
                 max_contribution = max(max_contribution, 0.3)
 
             # Check max depth
-            if tree.max_depth > 4:
+            if tree.max_depth > deep_chain:
                 sig = PackageSignal(
                     signal_id="DEPTH-003",
                     severity="medium",
@@ -985,7 +1155,8 @@ class SupplyChainAnalyzer:
                 signals.append(sig)
                 max_contribution = max(max_contribution, 0.9)
 
-        except Exception:
+        except (requests.RequestException, ValueError, KeyError, OSError) as e:
+            logger.debug("Dependency tree resolution failed for %s: %s", package_name, e)
             # Fallback to simple direct dep count check
             count = len(direct_deps)
             if count > 25:
@@ -1018,7 +1189,8 @@ class SupplyChainAnalyzer:
         try:
             analyzer = self._get_payload_analyzer()
             return analyzer.analyze_package(package_name, ecosystem, version)
-        except Exception:
+        except (OSError, ValueError, ImportError) as e:
+            logger.warning("Payload analysis failed for %s: %s", package_name, e)
             return []
 
     # -- Legacy compat method (used by tests) ---------------------------------

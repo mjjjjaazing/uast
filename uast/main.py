@@ -21,6 +21,8 @@ from uast.watcher import AgentWatcher
 from uast.reporter import SessionReporter
 from uast.display import Display
 from uast.analyzer import AGENT_AAL
+from uast.config import load_config, get_threshold, get_agent_aal
+from uast.logging import setup_logging
 
 console = Console()
 
@@ -108,6 +110,20 @@ def cli() -> None:
     default=False,
     help="Enable deep analysis (static payload scanning via AST).",
 )
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+    default="WARNING",
+    show_default=True,
+    help="Log level for file and console logging.",
+)
+@click.option(
+    "--quiet",
+    "-q",
+    is_flag=True,
+    default=False,
+    help="Suppress all log output to the console (file logging still active).",
+)
 def start(
     agent: str,
     project: str,
@@ -116,6 +132,8 @@ def start(
     block: bool,
     verbose: bool,
     deep: bool,
+    log_level: str,
+    quiet: bool,
 ) -> None:
     """Start monitoring an AI coding agent session.
 
@@ -126,12 +144,24 @@ def start(
       uast start --agent claude-code --threshold 7.0 --block
       uast start --verbose --output ./reports/session.json
       uast start --agent cursor --deep
+      uast start --log-level DEBUG
     """
+    setup_logging(level=log_level, quiet=quiet)
+
     project_path = Path(project).resolve()
     display = Display(console, verbose=verbose)
 
-    # Resolve AAL from agent choice
-    aal = AGENT_AAL.get(agent, 0.5)
+    # Load configuration (project config + user config + defaults)
+    cli_overrides: dict = {}
+    if threshold != 6.0:
+        cli_overrides["threshold"] = threshold
+    config = load_config(project_path=project_path, cli_overrides=cli_overrides or None)
+
+    # Resolve AAL from config (falls back to agent map)
+    aal = get_agent_aal(config, agent)
+
+    # Use config threshold (CLI override already merged in)
+    effective_threshold = get_threshold(config)
 
     # Print startup banner
     display.banner(agent, str(project_path))
@@ -155,12 +185,13 @@ def start(
     watcher = AgentWatcher(
         project_path=project_path,
         agent=agent,
-        threshold=threshold,
+        threshold=effective_threshold,
         block=block,
         display=display,
         reporter=reporter,
         aal=aal,
         deep=deep,
+        config=config,
     )
 
     # Handle Ctrl+C gracefully
@@ -227,7 +258,13 @@ def sessions() -> None:
     default="auto",
     help="Agent context for ARSM scoring.",
 )
-def check(package_name: str, ecosystem: str, json_output: bool, agent: str) -> None:
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+    default="WARNING",
+    help="Log level for file and console logging.",
+)
+def check(package_name: str, ecosystem: str, json_output: bool, agent: str, log_level: str) -> None:
     """Manually check a single package against the supply chain analyzer.
 
     \b
@@ -240,9 +277,12 @@ def check(package_name: str, ecosystem: str, json_output: bool, agent: str) -> N
     """
     from uast.analyzer import SupplyChainAnalyzer
 
-    aal = AGENT_AAL.get(agent, 0.5)
+    setup_logging(level=log_level, quiet=json_output)
+
+    config = load_config(project_path=Path("."))
+    aal = get_agent_aal(config, agent)
     display = Display(console)
-    analyzer = SupplyChainAnalyzer(aal=aal, deep=True)
+    analyzer = SupplyChainAnalyzer(aal=aal, deep=True, config=config)
 
     if not json_output:
         console.print(f"\n[dim]Analyzing [bold]{package_name}[/bold] ({ecosystem})...[/dim]")
@@ -280,6 +320,33 @@ def check(package_name: str, ecosystem: str, json_output: bool, agent: str) -> N
         click.echo(json_mod.dumps(output, indent=2))
     else:
         display.show_analysis_result(result)
+
+
+@cli.command("show-config")
+@click.option(
+    "--project",
+    "-p",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    default=".",
+    help="Project directory (for .uast.toml lookup).",
+)
+def show_config(project: str) -> None:
+    """Display the resolved UAST configuration.
+
+    \b
+    Shows merged configuration from all sources:
+      ~/.uast/config.toml  (user-level)
+      .uast.toml           (project-level)
+      built-in defaults
+
+    \b
+    Example:
+      uast show-config
+      uast show-config --project ./my-app
+    """
+    project_path = Path(project).resolve()
+    config = load_config(project_path=project_path)
+    console.print(json_mod.dumps(config, indent=2, default=str))
 
 
 if __name__ == "__main__":

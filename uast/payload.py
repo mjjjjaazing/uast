@@ -17,6 +17,7 @@ Uses only stdlib: ast, tempfile, zipfile, tarfile.
 from __future__ import annotations
 
 import ast
+import logging
 import os
 import re
 import sys
@@ -29,6 +30,8 @@ from pathlib import Path
 from typing import Optional
 
 from uast.analyzer import PackageSignal
+
+logger = logging.getLogger("uast.payload")
 
 
 @dataclass
@@ -242,21 +245,30 @@ class PayloadAnalyzer:
         self, name: str, ecosystem: str, version: Optional[str] = None
     ) -> list[PackageSignal]:
         """Download, extract, and analyze a package. Returns signals."""
+        logger.info("Payload analysis starting: %s (%s) version=%s", name, ecosystem, version)
+        # Validate package name to prevent command injection
+        if not re.match(r"^[a-zA-Z0-9][\w.\-]{0,213}$", name):
+            logger.warning("Invalid package name for payload analysis: %r", name)
+            return []
         if ecosystem != "pypi":
+            logger.debug("Payload analysis only supports PyPI — skipping %s", ecosystem)
             return []  # Only Python packages supported for now
 
         with tempfile.TemporaryDirectory(prefix="uast_payload_") as tmpdir:
             pkg_path = self._download_package(name, version, tmpdir)
             if not pkg_path:
+                logger.warning("Failed to download package %s for payload analysis", name)
                 return []
 
             extract_dir = os.path.join(tmpdir, "extracted")
             os.makedirs(extract_dir, exist_ok=True)
 
             if not self._extract_archive(pkg_path, extract_dir):
+                logger.warning("Failed to extract package %s", name)
                 return []
 
             findings = self._analyze_python_files(extract_dir)
+            logger.info("Payload analysis complete: %s → %d findings", name, len(findings))
             return self._findings_to_signals(findings)
 
     def _download_package(

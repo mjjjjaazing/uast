@@ -1,0 +1,14 @@
+# UAST Code Owners
+# Requires review for all changes under uast/
+
+# Default owner for all files
+* @mjjjjaazing
+
+# Security-sensitive modules require explicit review
+uast/payload.py     @mjjjjaazing
+uast/watcher.py     @mjjjjaazing
+uast/http_client.py @mjjjjaazing
+uast/analyzer.py    @mjjjjaazing
+
+# CI/CD changes
+.github/            @mjjjjaazing

@@ -341,7 +341,7 @@ class Display:
                     f"[red]{report_summary.get('alerts', 0)}[/red]" if report_summary.get("alerts", 0) else "0",
                     data.get("started_at", "")[:16],
                 )
-            except Exception:
+            except (ValueError, KeyError, OSError):
                 table.add_row(report_path.name, "—", "—", "—", "—")
 
         self.console.print()

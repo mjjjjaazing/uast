@@ -254,9 +254,43 @@ The paper formalises three original contributions:
 
 ---
 
+## Configuration
+
+UAST supports TOML configuration with 3-level precedence:
+
+```
+CLI flags  >  project .uast.toml  >  user ~/.uast/config.toml  >  built-in defaults
+```
+
+```bash
+# View resolved configuration
+uast show-config
+
+# View for a specific project
+uast show-config --project ./my-app
+```
+
+Example `.uast.toml`:
+
+```toml
+threshold = 7.0
+
+[arsm]
+alpha = 0.30
+beta = 0.25
+
+[blocklist]
+pypi = ["evil-package"]
+
+[allowlist]
+pypi = ["my-internal-package"]
+```
+
+---
+
 ## Roadmap
 
-**v0.1 — current**
+**v0.1 — initial release**
 - Process watcher + file watcher (dual interception)
 - Supply chain analyzer (BDA MVP)
 - ARSM scoring engine with full formula implementation
@@ -270,12 +304,21 @@ The paper formalises three original contributions:
 - Terminal output + JSON session reports (schema v2)
 - Claude Code, Cursor, Copilot, Windsurf, Codeium
 
-**v0.2**
+**v0.2 — current (foundation hardening)**
+- TOML configuration system (project + user + defaults)
+- Structured logging with rotation and log injection prevention
+- HTTP retry with exponential backoff
+- Input sanitization (package names, URLs, config values)
+- Security hardening (file permissions, process tracking, SSRF prevention)
+- CI/CD pipeline (GitHub Actions, pre-commit, PyPI publishing)
+- 322 tests, 85% coverage
+
+**v0.3**
 - Web dashboard with session history
 - Full AVT taxonomy classifier (all 22 classes)
 - Team sharing + alert webhooks (Slack, email)
 
-**v0.3**
+**v0.4**
 - Agent Reasoning Auditor (ARA layer)
 - Provenance chain verification (Merkle-tree hashing)
 - ISO 42001 audit evidence export
