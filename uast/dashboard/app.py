@@ -3,6 +3,8 @@ Lightweight Flask dashboard for viewing UAST session reports.
 
 Reads JSON session files from ~/.uast/sessions/ (configurable).
 No database — pure file-based. Server-rendered with Jinja2.
+
+Flask is an optional dependency — import is deferred to create_app().
 """
 
 from __future__ import annotations
@@ -12,8 +14,6 @@ import logging
 import re
 from pathlib import Path
 from typing import Any, Optional
-
-from flask import Flask, abort, jsonify, redirect, render_template, url_for
 
 logger = logging.getLogger("uast.dashboard")
 
@@ -89,8 +89,13 @@ def _list_sessions(sessions_dir: Path) -> list[dict[str, Any]]:
 # Flask app factory
 # ---------------------------------------------------------------------------
 
-def create_app(sessions_dir: Optional[Path] = None) -> Flask:
-    """Create and configure the Flask dashboard app."""
+def create_app(sessions_dir: Optional[Path] = None):  # noqa: ANN201
+    """Create and configure the Flask dashboard app.
+
+    Raises ImportError if Flask is not installed.
+    """
+    from flask import Flask, abort, jsonify, redirect, render_template, url_for
+
     template_dir = Path(__file__).parent / "templates"
     static_dir = Path(__file__).parent / "static"
 

@@ -9,6 +9,8 @@ Covers:
   - API endpoints (JSON)
   - Security: path traversal prevention, headers
   - Edge cases: empty dir, missing files, malformed JSON
+
+Flask-dependent tests are skipped if Flask is not installed.
 """
 
 import json
@@ -16,7 +18,16 @@ from pathlib import Path
 
 import pytest
 
-from uast.dashboard.app import _is_safe_filename, _list_sessions, _load_session, create_app
+from uast.dashboard.app import _is_safe_filename, _list_sessions, _load_session
+
+try:
+    import flask as _flask  # noqa: F401
+    HAS_FLASK = True
+except ImportError:
+    HAS_FLASK = False
+
+requires_flask = pytest.mark.skipif(not HAS_FLASK, reason="Flask not installed")
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -102,6 +113,7 @@ def sessions_dir(tmp_path):
 @pytest.fixture()
 def app(sessions_dir):
     """Create Flask test app."""
+    from uast.dashboard.app import create_app
     application = create_app(sessions_dir=sessions_dir)
     application.config["TESTING"] = True
     return application
@@ -114,7 +126,7 @@ def client(app):
 
 
 # ---------------------------------------------------------------------------
-# Filename validation
+# Filename validation (no Flask needed)
 # ---------------------------------------------------------------------------
 
 class TestFilenameValidation:
@@ -147,7 +159,7 @@ class TestFilenameValidation:
 
 
 # ---------------------------------------------------------------------------
-# Data helpers
+# Data helpers (no Flask needed)
 # ---------------------------------------------------------------------------
 
 class TestDataHelpers:
@@ -192,9 +204,10 @@ class TestDataHelpers:
 
 
 # ---------------------------------------------------------------------------
-# HTML routes
+# HTML routes (requires Flask)
 # ---------------------------------------------------------------------------
 
+@requires_flask
 class TestHTMLRoutes:
 
     def test_index_redirects_to_sessions(self, client):
@@ -210,6 +223,7 @@ class TestHTMLRoutes:
         assert b"cursor" in resp.data
 
     def test_sessions_list_empty(self, tmp_path):
+        from uast.dashboard.app import create_app
         empty = tmp_path / "empty_sessions"
         empty.mkdir()
         application = create_app(sessions_dir=empty)
@@ -260,9 +274,10 @@ class TestHTMLRoutes:
 
 
 # ---------------------------------------------------------------------------
-# API routes
+# API routes (requires Flask)
 # ---------------------------------------------------------------------------
 
+@requires_flask
 class TestAPIRoutes:
 
     def test_api_sessions_list(self, client):
@@ -289,9 +304,10 @@ class TestAPIRoutes:
 
 
 # ---------------------------------------------------------------------------
-# Security headers
+# Security headers (requires Flask)
 # ---------------------------------------------------------------------------
 
+@requires_flask
 class TestSecurityHeaders:
 
     def test_nosniff_header(self, client):
@@ -317,16 +333,19 @@ class TestSecurityHeaders:
 
 
 # ---------------------------------------------------------------------------
-# App factory
+# App factory (requires Flask)
 # ---------------------------------------------------------------------------
 
+@requires_flask
 class TestAppFactory:
 
     def test_create_app_default_sessions_dir(self):
+        from uast.dashboard.app import create_app
         application = create_app()
         assert application.config["SESSIONS_DIR"] == Path.home() / ".uast" / "sessions"
 
     def test_create_app_custom_sessions_dir(self, tmp_path):
+        from uast.dashboard.app import create_app
         application = create_app(sessions_dir=tmp_path)
         assert application.config["SESSIONS_DIR"] == tmp_path
 
