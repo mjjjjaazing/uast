@@ -46,6 +46,9 @@ UAST closes that gap.
 | Maintainer trust signals | AVT-D4-01 | Disposable email, missing identity detection |
 | Metadata spoofing | AVT-D4-01 | Cross-reference description vs package identity |
 | Release pattern anomalies | AVT-D3-01 | Single-version and rapid-fire release detection |
+| Supply chain provenance failure | AVT-D3-05 | Source-to-registry hash mismatch |
+| Suspicious version changes | AVT-D3-02 | Version diff detecting new imports, entropy, hooks |
+| Dependency tree drift | — | Merkle tree hash comparison across sessions |
 
 ---
 
@@ -95,6 +98,16 @@ uast check some-package --json
 
 # Specify agent context for ARSM scoring
 uast check some-package --agent cursor
+
+# Enable provenance verification (git clone + build + hash comparison)
+uast check some-package --provenance
+```
+
+### Compare dependency trees
+
+```bash
+# Detect drift between two sessions
+uast diff-trees session_a.json session_b.json
 ```
 
 ### View saved reports
@@ -179,6 +192,28 @@ With `--deep` (or always on `uast check`), UAST downloads the package source and
 | PAYLOAD-006 | `__import__()`/`importlib` with variable arg | medium |
 | PAYLOAD-007 | File writes to `~/.ssh/`, `~/.bashrc`, `/etc/` | critical |
 
+### Provenance verification (`--provenance`)
+
+With `--provenance`, UAST verifies that a package on the registry was built from its declared source:
+
+| Signal | Meaning | Severity |
+|---|---|---|
+| PROV-001 | Source-to-registry hash mismatch | critical |
+| PROV-002 | No source repository declared | low |
+| PROV-003 | Source verified, hash matches | info (lowers risk) |
+| SIG-001 | PyPI attestation present/verified | info (lowers risk) |
+| SIG-002 | No attestation available | info |
+| SIG-003 | Attestation verification failed | critical |
+| VDIFF-001 | Suspicious changes between versions | varies |
+
+The pipeline: extract repo URL from metadata → shallow git clone → build in sandbox → compare SHA-256 hashes against the registry artifact. If full build comparison fails (e.g. C extensions), falls back to file-level hash comparison.
+
+Sigstore/PEP 740 attestation checking is available as an optional dependency:
+
+```bash
+pip install uast[provenance]  # requires Python 3.10+
+```
+
 ---
 
 ## Example output
@@ -209,11 +244,11 @@ With `--deep` (or always on `uast check`), UAST downloads the package source and
 
 ## Session reports
 
-Every session saves a structured JSON report (schema v2):
+Every session saves a structured JSON report (schema v3):
 
 ```json
 {
-  "version": "2",
+  "version": "3",
   "agent": "cursor",
   "project": "/Users/mike/payments-api",
   "started_at": "2025-01-01T14:22:00",
@@ -234,7 +269,17 @@ Every session saves a structured JSON report (schema v2):
       "verdict": "critical",
       "avt_classes": ["AVT-D3-01", "AVT-D3-04"],
       "arsm": {"aal": 0.7, "cis": 1.0, "pc": 0.3, "srf": 0.0},
-      "signals": [...]
+      "signals": [...],
+      "dependency_tree_hash": "a1b2c3...",
+      "provenance": {
+        "source_verified": false,
+        "verification_method": "none",
+        "attestation": "none"
+      },
+      "version_diff": {
+        "previous_version": "1.0.0",
+        "suspicious_changes": []
+      }
     }
   ]
 }
@@ -291,6 +336,16 @@ pypi = ["evil-package"]
 
 [allowlist]
 pypi = ["my-internal-package"]
+
+[provenance]
+enabled = false        # enable by default (or use --provenance flag)
+clone_timeout = 60     # git clone timeout in seconds
+build_timeout = 120    # build timeout in seconds
+max_repo_size_mb = 100 # skip repos larger than this
+
+[version_diff]
+enabled = true         # version diff runs automatically in deep mode
+timeout = 60
 ```
 
 ---
@@ -320,7 +375,7 @@ pypi = ["my-internal-package"]
 - CI/CD pipeline (GitHub Actions, pre-commit, PyPI publishing)
 - 322 tests, 85% coverage
 
-**v0.3 — current (detection engine expansion)**
+**v0.3 (detection engine expansion)**
 - AVT D1 detectors: prompt injection (INJECT-001), context poisoning (POISON-001)
 - AVT D2 detectors: privilege escalation (PRIV-001), scope creep (SCOPE-001)
 - AVT D4 detectors: maintainer trust (MAINTAINER-001), metadata spoofing (SPOOF-001)
@@ -330,15 +385,28 @@ pypi = ["my-internal-package"]
 - Rebalanced ARSM signal weights (9 categories)
 - 424 tests, 87% coverage
 
-**v0.4**
+**v0.4 — current (provenance chain verification)**
+- Source-to-registry verification: git clone + build + SHA-256 hash comparison
+- Sigstore/PEP 740 attestation checking (optional dep, Python 3.10+)
+- Version diffing: detect suspicious changes between releases (new imports, high-entropy strings, install hooks, metadata stripping)
+- Merkle tree hashing for tamper-evident dependency audit trails
+- `uast diff-trees` command for drift detection between sessions
+- `--provenance` flag for `check` and `start` commands
+- Provenance Confidence (PC) dynamically adjusted from verification signals
+- New signals: PROV-001/002/003, SIG-001/002/003, VDIFF-001
+- AVT-D3-05 (supply chain provenance failure)
+- ARSM rebalanced to 10 weight categories (provenance: 0.10)
+- Report schema v3 with provenance, version_diff, and tree hash fields
+- 547 tests, 83% coverage
+
+**v0.5**
 - Web dashboard with session history
 - Threat intelligence integration (OSV.dev, safety-db)
 - npm payload analysis (JS/TS AST scanning)
 - Team sharing + alert webhooks (Slack, email)
 
-**v0.4**
+**v0.6**
 - Agent Reasoning Auditor (ARA layer)
-- Provenance chain verification (Merkle-tree hashing)
 - ISO 42001 audit evidence export
 - REST API
 

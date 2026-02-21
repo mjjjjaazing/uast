@@ -5,6 +5,28 @@ All notable changes to UAST will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - Unreleased
+
+### Added
+- **Source-to-registry verification** (`--provenance`): Shallow git clone → isolated build → SHA-256 hash comparison against registry artifact. File-level fallback for C extension packages. Git clone safety (`GIT_TERMINAL_PROMPT=0`, `GIT_LFS_SKIP_SMUDGE=1`, hooks disabled). Build sandbox (`PIP_NO_INDEX=1`, isolated HOME, cleared proxy env vars).
+- **Sigstore/PEP 740 attestation checking**: Tier 1 (HTTP check via PyPI Simple API, no extra deps). Tier 2 (full cryptographic verification via `sigstore-python`, optional dep requiring Python 3.10+). Install with `pip install uast[provenance]`.
+- **Version diffing**: Detects suspicious changes between package versions — new `subprocess`/`socket`/`os.system` imports, high-entropy strings (Shannon entropy > 4.5), sensitive file writes, new install-time hooks in `setup.py`, LICENSE/README removal, new dependency additions.
+- **Merkle tree hashing**: Tamper-evident SHA-256 hash of dependency trees (`H(name||version||sort(child_hashes))`). Deterministic and order-independent. Stored in session reports for audit trails.
+- `uast diff-trees <session1> <session2>` command for dependency tree drift detection
+- `--provenance` flag on `check` and `start` commands
+- New signals: PROV-001 (hash mismatch, critical), PROV-002 (no source repo, low), PROV-003 (source verified, info), SIG-001 (attestation present, info), SIG-002 (no attestation, info), SIG-003 (attestation failed, critical), VDIFF-001 (suspicious version change, varies)
+- `AVT-D3-05` class (supply chain provenance failure) mapped from PROV-001 or SIG-003
+- `[provenance]` and `[version_diff]` config sections in `.uast.toml`
+- `uast/package_utils.py` — shared `download_package()` and `extract_archive()` with path traversal protection
+- Report schema v3 with `dependency_tree_hash`, `provenance`, and `version_diff` fields per result
+- 547 tests (up from 424), 83% coverage
+
+### Changed
+- ARSM signal weights rebalanced from 9 to 10 categories (added provenance=0.10, rebalanced others to sum to 1.0)
+- Provenance Confidence (PC) now dynamically adjusted: source hash match +0.3, attestation verified +0.2, attestation failed -0.5, hash mismatch -0.4
+- Download/extract logic refactored from `payload.py` into shared `package_utils.py`
+- Version bumped to 0.4.0
+
 ## [0.3.0] - Unreleased
 
 ### Added
