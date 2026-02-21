@@ -14,22 +14,21 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Optional
 from difflib import SequenceMatcher
+from typing import Optional
 
 import requests
 
-logger = logging.getLogger("uast.resolver")
-
-from uast.http_client import http_client
 from uast.analyzer import (
-    PackageSignal,
-    PYPI_SAFE,
     NPM_SAFE,
-    POPULAR_PYPI,
     POPULAR_NPM,
+    POPULAR_PYPI,
+    PYPI_SAFE,
     SUSPICIOUS_NAME_PATTERNS,
 )
+from uast.http_client import http_client
+
+logger = logging.getLogger("uast.resolver")
 
 
 @dataclass

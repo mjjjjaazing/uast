@@ -9,10 +9,9 @@ Report schema v2 adds ARSM dimensions and dependency tree summary.
 
 from __future__ import annotations
 
-import json
 import datetime
+import json
 from pathlib import Path
-from dataclasses import asdict
 
 from uast.analyzer import AnalysisResult
 
@@ -102,7 +101,8 @@ class SessionReporter:
 
         # Set file permissions to 0o600 (user-only read/write)
         try:
-            import os, stat
+            import os
+            import stat
             os.chmod(str(self.output_path), stat.S_IRUSR | stat.S_IWUSR)
         except OSError:
             pass  # Best effort

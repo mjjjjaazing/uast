@@ -7,17 +7,16 @@ Keeps formatting centralized and easy to change.
 
 from __future__ import annotations
 
-import json
 import datetime
+import json
 from pathlib import Path
 
+from rich import box
 from rich.console import Console
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
-from rich.rule import Rule
-from rich.columns import Columns
-from rich import box
 
 from uast.analyzer import AnalysisResult
 
@@ -59,7 +58,7 @@ class Display:
             highlight=False,
         )
         self.console.print(
-            f"[dim]github.com/mjjjjaazing/uast[/dim]",
+            "[dim]github.com/mjjjjaazing/uast[/dim]",
             highlight=False,
         )
         self.console.print()
@@ -67,7 +66,7 @@ class Display:
     def watching(self, project_path: Path, agent: str, threshold: float) -> None:
         """Print session start confirmation."""
         self.console.print(
-            f"  [green]✓[/green]  [dim]session started[/dim]"
+            "  [green]✓[/green]  [dim]session started[/dim]"
         )
         self.console.print(
             f"  [green]✓[/green]  [dim]watching[/dim]  [bold]{project_path}[/bold]"
@@ -80,10 +79,10 @@ class Display:
             f"[bold]ARS ≥ {threshold:.1f}[/bold] triggers alert"
         )
         self.console.print(
-            f"  [green]✓[/green]  [dim]process watcher active[/dim]"
+            "  [green]✓[/green]  [dim]process watcher active[/dim]"
         )
         self.console.print(
-            f"  [green]✓[/green]  [dim]file watcher active[/dim]"
+            "  [green]✓[/green]  [dim]file watcher active[/dim]"
         )
         self.console.print()
         self.console.print(
@@ -338,7 +337,10 @@ class Display:
                     report_path.name,
                     data.get("agent", "—"),
                     str(report_summary.get("total_packages", 0)),
-                    f"[red]{report_summary.get('alerts', 0)}[/red]" if report_summary.get("alerts", 0) else "0",
+                    (
+                        f"[red]{report_summary.get('alerts', 0)}[/red]"
+                        if report_summary.get("alerts", 0) else "0"
+                    ),
                     data.get("started_at", "")[:16],
                 )
             except (ValueError, KeyError, OSError):
@@ -356,7 +358,7 @@ class Display:
         results = data.get("results", [])
 
         self.console.print()
-        self.console.print(f"  [bold]Session Report[/bold]")
+        self.console.print("  [bold]Session Report[/bold]")
         self.console.print(f"  [dim]Agent:[/dim]   {data.get('agent', '—')}")
         self.console.print(f"  [dim]Project:[/dim] {data.get('project', '—')}")
         self.console.print(f"  [dim]Date:[/dim]    {data.get('started_at', '—')[:16]}")

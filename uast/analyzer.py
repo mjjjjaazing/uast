@@ -20,18 +20,16 @@ Detection signals:
 
 from __future__ import annotations
 
+import datetime
 import logging
 import math
 import re
-import time
-import datetime
 from dataclasses import dataclass, field
-from typing import Optional
 from difflib import SequenceMatcher
+from typing import Optional
 
 import requests
 
-from uast.http_client import http_client
 from uast.config import (
     DEFAULT_CONFIG,
     get_age_thresholds,
@@ -39,10 +37,10 @@ from uast.config import (
     get_arsm_coefficients,
     get_blocklist,
     get_dependency_config,
-    get_http_config,
     get_similarity_thresholds,
     get_velocity_config,
 )
+from uast.http_client import http_client
 
 logger = logging.getLogger("uast.analyzer")
 
@@ -86,6 +84,7 @@ class AnalysisResult:
     arsm: Optional[dict] = None          # ARSM breakdown
     dependency_tree: Optional[dict] = None  # dep tree summary
     did_you_mean: Optional[str] = None   # suggestion for hallucinated packages
+    confidence: str = "high"             # "high", "medium", "low" — scoring confidence
 
     @property
     def is_flagged(self) -> bool:
@@ -192,7 +191,10 @@ def sanitize_package_name(name: str) -> str:
     if not name:
         raise ValueError("Empty package name")
     if len(name) > MAX_PACKAGE_NAME_LENGTH:
-        raise ValueError(f"Package name too long ({len(name)} chars, max {MAX_PACKAGE_NAME_LENGTH})")
+        raise ValueError(
+            f"Package name too long "
+            f"({len(name)} chars, max {MAX_PACKAGE_NAME_LENGTH})"
+        )
     if not _VALID_PACKAGE_NAME.match(name):
         raise ValueError(f"Invalid package name: {name!r} — contains disallowed characters")
     return name
@@ -220,12 +222,15 @@ class SupplyChainAnalyzer:
 
     # Signal weights (sum to 1.0)
     WEIGHTS = {
-        "age_velocity":   0.25,
-        "name_squatting": 0.20,
-        "pattern_match":  0.10,
-        "metadata":       0.10,
-        "depth":          0.10,
-        "payload":        0.25,
+        "age_velocity":   0.20,
+        "name_squatting": 0.16,
+        "pattern_match":  0.06,
+        "metadata":       0.06,
+        "depth":          0.08,
+        "payload":        0.20,
+        "injection":      0.10,
+        "trust":          0.08,
+        "spoofing":       0.06,
     }
 
     def __init__(
@@ -358,6 +363,15 @@ class SupplyChainAnalyzer:
             result.signals.append(age_signal)
         raw_score += age_contribution * self.WEIGHTS["age_velocity"]
 
+        # -- Signal 1b: Release pattern analysis --------------------------------
+        release_signal, release_contribution = self._check_release_pattern(
+            releases, package_name
+        )
+        if release_signal:
+            result.signals.append(release_signal)
+            # Add release contribution to age_velocity (shared weight)
+            raw_score += release_contribution * self.WEIGHTS["age_velocity"] * 0.3
+
         # -- Signal 2: Name squatting -----------------------------------------
         squatting_signal, squatting_contribution = self._check_name_squatting(
             package_name, POPULAR_PYPI
@@ -395,12 +409,36 @@ class SupplyChainAnalyzer:
                 payload_contribution = max(payload_contribution, s.score_contribution)
         raw_score += payload_contribution * self.WEIGHTS["payload"]
 
+        # -- Signal 7: Prompt injection in description ------------------------
+        inject_signal, inject_contribution = self._check_prompt_injection(
+            info.get("summary", "") or info.get("description", ""),
+            package_name,
+        )
+        if inject_signal:
+            result.signals.append(inject_signal)
+        raw_score += inject_contribution * self.WEIGHTS["injection"]
+
+        # -- Signal 8: Maintainer trust -----------------------------------------
+        trust_signal, trust_contribution = self._check_maintainer_trust(info, "pypi")
+        if trust_signal:
+            result.signals.append(trust_signal)
+        raw_score += trust_contribution * self.WEIGHTS["trust"]
+
+        # -- Signal 9: Metadata spoofing ----------------------------------------
+        spoof_signal, spoof_contribution = self._check_metadata_spoofing(
+            info, package_name, "pypi"
+        )
+        if spoof_signal:
+            result.signals.append(spoof_signal)
+        raw_score += spoof_contribution * self.WEIGHTS["spoofing"]
+
         # -- Compute ARSM score -----------------------------------------------
         result.cvss_base = round(min(raw_score * 10.0, 10.0), 1)
 
+        cis = self._compute_cis(result.signals)
         arsm_ctx = ARSMContext(
             aal=self.aal,
-            cis=1.0,  # Default — clean context assumed
+            cis=cis,
             pc=self._estimate_provenance_confidence(info),
             srf=self._estimate_systemic_replication(package_name, "pypi"),
         )
@@ -408,7 +446,7 @@ class SupplyChainAnalyzer:
         coeff = get_arsm_coefficients(self.config)
         result.arsm = {
             "aal": arsm_ctx.aal,
-            "cis": arsm_ctx.cis,
+            "cis": round(arsm_ctx.cis, 2),
             "pc": arsm_ctx.pc,
             "srf": round(arsm_ctx.srf, 2),
             "alpha": coeff.get("alpha", 0.30),
@@ -417,14 +455,15 @@ class SupplyChainAnalyzer:
             "delta": coeff.get("delta", 0.20),
         }
 
-        # Set verdict and AVT classes
+        # Set verdict, AVT classes, and confidence
         result.verdict, result.avt_classes, result.recommendation = (
             self._compute_verdict(result.ars_score, result.signals)
         )
+        result.confidence = self._compute_confidence(result.signals, "pypi")
 
         logger.info(
-            "PyPI analysis complete: %s → ARS=%.1f verdict=%s signals=%d",
-            package_name, result.ars_score, result.verdict, len(result.signals),
+            "PyPI analysis complete: %s → ARS=%.1f verdict=%s confidence=%s signals=%d",
+            package_name, result.ars_score, result.verdict, result.confidence, len(result.signals),
         )
         return result
 
@@ -555,12 +594,36 @@ class SupplyChainAnalyzer:
         # -- Signal 6: Payload (npm not supported yet) ------------------------
         # payload analysis only for pypi currently
 
+        # -- Signal 7: Prompt injection in description ------------------------
+        inject_signal, inject_contribution = self._check_prompt_injection(
+            data.get("description", ""),
+            package_name,
+        )
+        if inject_signal:
+            result.signals.append(inject_signal)
+        raw_score += inject_contribution * self.WEIGHTS["injection"]
+
+        # -- Signal 8: Maintainer trust -----------------------------------------
+        trust_signal, trust_contribution = self._check_maintainer_trust(data, "npm")
+        if trust_signal:
+            result.signals.append(trust_signal)
+        raw_score += trust_contribution * self.WEIGHTS["trust"]
+
+        # -- Signal 9: Metadata spoofing ----------------------------------------
+        spoof_signal, spoof_contribution = self._check_metadata_spoofing(
+            data, package_name, "npm"
+        )
+        if spoof_signal:
+            result.signals.append(spoof_signal)
+        raw_score += spoof_contribution * self.WEIGHTS["spoofing"]
+
         # -- Compute ARSM score -----------------------------------------------
         result.cvss_base = round(min(raw_score * 10.0, 10.0), 1)
 
+        cis = self._compute_cis(result.signals)
         arsm_ctx = ARSMContext(
             aal=self.aal,
-            cis=1.0,
+            cis=cis,
             pc=self._estimate_provenance_confidence_npm(data),
             srf=self._estimate_systemic_replication(package_name, "npm"),
         )
@@ -568,7 +631,7 @@ class SupplyChainAnalyzer:
         coeff = get_arsm_coefficients(self.config)
         result.arsm = {
             "aal": arsm_ctx.aal,
-            "cis": arsm_ctx.cis,
+            "cis": round(arsm_ctx.cis, 2),
             "pc": arsm_ctx.pc,
             "srf": round(arsm_ctx.srf, 2),
             "alpha": coeff.get("alpha", 0.30),
@@ -580,10 +643,11 @@ class SupplyChainAnalyzer:
         result.verdict, result.avt_classes, result.recommendation = (
             self._compute_verdict(result.ars_score, result.signals)
         )
+        result.confidence = self._compute_confidence(result.signals, "npm")
 
         logger.info(
-            "npm analysis complete: %s → ARS=%.1f verdict=%s signals=%d",
-            package_name, result.ars_score, result.verdict, len(result.signals),
+            "npm analysis complete: %s → ARS=%.1f verdict=%s confidence=%s signals=%d",
+            package_name, result.ars_score, result.verdict, result.confidence, len(result.signals),
         )
         return result
 
@@ -717,6 +781,89 @@ class SupplyChainAnalyzer:
             logger.debug("Download stats fetch failed for %s: %s", name, e)
         return None
 
+    # -- CIS & confidence computation ------------------------------------------
+
+    def _compute_cis(self, signals: list[PackageSignal]) -> float:
+        """
+        Compute Context Integrity Score (0-1) from detected signals.
+
+        CIS measures whether the agent's decision context was compromised.
+        Signals that indicate context manipulation lower CIS:
+          - INJECT-001: Prompt injection attempts → severe CIS degradation
+          - POISON-001: Context poisoning → moderate CIS degradation
+          - SPOOF-001: Metadata spoofing → moderate CIS degradation
+          - HALLUC-001: Hallucinated package → CIS near zero (agent hallucinated)
+        """
+        cis = 1.0
+        signal_ids = {s.signal_id for s in signals}
+
+        # Hallucinated package = CIS near zero (context is completely unreliable)
+        if "HALLUC-001" in signal_ids:
+            cis -= 0.8
+
+        # Prompt injection = severe context compromise
+        if "INJECT-001" in signal_ids:
+            cis -= 0.5
+
+        # Context poisoning = moderate context compromise
+        if "POISON-001" in signal_ids:
+            cis -= 0.3
+
+        # Metadata spoofing = moderate context compromise
+        if "SPOOF-001" in signal_ids:
+            cis -= 0.2
+
+        return max(cis, 0.0)
+
+    def _compute_confidence(self, signals: list[PackageSignal], ecosystem: str) -> str:
+        """
+        Compute confidence level in the ARS score.
+
+        High: Multiple signal categories checked, clear pattern
+        Medium: Some signals checked, partial data
+        Low: Limited data available, few checks possible
+        """
+        signal_ids = {s.signal_id for s in signals}
+        categories_checked = 0
+
+        # Count distinct signal categories that returned data
+        if any(sid.startswith("AGE-") or sid.startswith("VEL-") for sid in signal_ids):
+            categories_checked += 1
+        if any(sid.startswith("SQUAT-") for sid in signal_ids):
+            categories_checked += 1
+        if any(sid.startswith("META-") for sid in signal_ids):
+            categories_checked += 1
+        if any(sid.startswith("DEPTH-") for sid in signal_ids):
+            categories_checked += 1
+        if any(sid.startswith("PAYLOAD-") for sid in signal_ids):
+            categories_checked += 1
+        if any(sid.startswith("INJECT-") for sid in signal_ids):
+            categories_checked += 1
+        if any(sid.startswith("MAINTAINER-") or sid.startswith("SPOOF-") for sid in signal_ids):
+            categories_checked += 1
+
+        # Network errors reduce confidence
+        has_net_error = any(sid == "NET-001" for sid in signal_ids)
+        if has_net_error:
+            return "low"
+
+        # Hallucinated package — high confidence in the result
+        if "HALLUC-001" in signal_ids:
+            return "high"
+
+        # Clean packages with allowlist match — high confidence
+        if "ALLOW-001" in signal_ids:
+            return "high"
+
+        # Multiple categories with signals — high confidence
+        if categories_checked >= 3:
+            return "high"
+        if categories_checked >= 1:
+            return "medium"
+
+        # No signals at all — the package looks clean but we checked
+        return "medium"
+
     # -- Hallucinated package detection ---------------------------------------
 
     def _handle_hallucinated_package(
@@ -837,7 +984,10 @@ class SupplyChainAnalyzer:
             return PackageSignal(
                 signal_id="VEL-001" if velocity_note else "AGE-002",
                 severity="high" if velocity_note else "medium",
-                title=f"Package is {age_days} days old" + (" with anomalous velocity" if velocity_note else ""),
+                title=(
+                    f"Package is {age_days} days old"
+                    + (" with anomalous velocity" if velocity_note else "")
+                ),
                 detail=(
                     f"{name} was published {age_days} days ago. "
                     "Recent packages have not yet been peer-reviewed by the community."
@@ -907,13 +1057,76 @@ class SupplyChainAnalyzer:
             return PackageSignal(
                 signal_id="VEL-001" if velocity_note else "AGE-002",
                 severity="high" if velocity_note else "medium",
-                title=f"Package is {age_days} days old" + (" with anomalous velocity" if velocity_note else ""),
+                title=(
+                    f"Package is {age_days} days old"
+                    + (" with anomalous velocity" if velocity_note else "")
+                ),
                 detail=(
                     f"{name} is a relatively new package ({age_days} days)."
                     + velocity_note
                 ),
                 score_contribution=contribution,
             ), contribution
+
+        return None, 0.0
+
+    def _check_release_pattern(
+        self, releases: dict, package_name: str
+    ) -> tuple[Optional[PackageSignal], float]:
+        """
+        Analyze release history for suspicious patterns.
+
+        Flags:
+          - Single version only (common in throwaway malicious packages)
+          - Rapid-fire releases (many versions in a short window)
+        """
+        version_count = len(releases)
+        if version_count == 0:
+            return None, 0.0
+
+        # Single version — common in adversarial packages
+        if version_count == 1:
+            return PackageSignal(
+                signal_id="RELEASE-001",
+                severity="low",
+                title="Single release version",
+                detail=(
+                    f"{package_name} has only 1 published version. "
+                    "Single-version packages are more common in adversarial scenarios."
+                ),
+                score_contribution=0.2,
+            ), 0.2
+
+        # Check for rapid-fire releases (many versions in short window)
+        timestamps = []
+        for version_files in releases.values():
+            for f in version_files:
+                upload_str = f.get("upload_time", "")
+                if upload_str:
+                    try:
+                        timestamps.append(datetime.datetime.fromisoformat(upload_str))
+                    except ValueError:
+                        pass
+
+        if len(timestamps) >= 3:
+            timestamps.sort()
+            span_days = (timestamps[-1] - timestamps[0]).days
+            if span_days > 0:
+                releases_per_day = len(timestamps) / span_days
+                # More than 2 releases per day sustained is unusual
+                if releases_per_day > 2.0 and span_days < 7:
+                    return PackageSignal(
+                        signal_id="RELEASE-002",
+                        severity="medium",
+                        title=f"Rapid-fire releases ({len(timestamps)} in {span_days} days)",
+                        detail=(
+                            f"{package_name} published {len(timestamps)} versions "
+                            f"in {span_days} days "
+                            f"({releases_per_day:.1f}/day). Rapid releases can indicate "
+                            "an attacker iterating on payload delivery."
+                        ),
+                        score_contribution=0.4,
+                    ), 0.4
 
         return None, 0.0
 
@@ -1018,7 +1231,10 @@ class SupplyChainAnalyzer:
                 signal_id="META-001",
                 severity="medium" if score >= 0.5 else "low",
                 title=f"Sparse package metadata ({len(issues)} issue(s))",
-                detail=f"Missing: {', '.join(issues)}. Legitimate packages typically have complete metadata.",
+                detail=(
+                    f"Missing: {', '.join(issues)}. "
+                    "Legitimate packages typically have complete metadata."
+                ),
                 score_contribution=min(score, 1.0),
             ), min(score, 1.0)
 
@@ -1041,7 +1257,8 @@ class SupplyChainAnalyzer:
             repo = data.get("repository", {})
             repo_url = repo.get("url", "") if isinstance(repo, dict) else str(repo)
             repo_url = repo_url.replace("git+", "").replace("git://", "https://").rstrip(".git")
-            if repo_url and repo_url.startswith("http") and not self._verify_repository_url(repo_url):
+            if (repo_url and repo_url.startswith("http")
+                    and not self._verify_repository_url(repo_url)):
                 issues.append(f"repository URL returns 404: {repo_url}")
                 score += 0.35
 
@@ -1110,7 +1327,8 @@ class SupplyChainAnalyzer:
                     title=f"Very high transitive dependency count ({tree.total_count})",
                     detail=(
                         f"Package has {tree.total_count} transitive dependencies. "
-                        f"High counts expand the attack surface for supply chain attacks (AVT-D3-04)."
+                        "High counts expand the attack surface "
+                        "for supply chain attacks (AVT-D3-04)."
                     ),
                     score_contribution=0.5,
                 )
@@ -1134,7 +1352,10 @@ class SupplyChainAnalyzer:
                     signal_id="DEPTH-003",
                     severity="medium",
                     title=f"Deep dependency chain (depth {tree.max_depth})",
-                    detail=f"Dependency tree reaches depth {tree.max_depth}. Deep chains are harder to audit.",
+                    detail=(
+                        f"Dependency tree reaches depth {tree.max_depth}. "
+                        "Deep chains are harder to audit."
+                    ),
                     score_contribution=0.35,
                 )
                 signals.append(sig)
@@ -1145,7 +1366,10 @@ class SupplyChainAnalyzer:
                 sig = PackageSignal(
                     signal_id="DEPTH-SUSP",
                     severity="critical",
-                    title=f"Suspicious package(s) in dependency tree: {', '.join(tree.suspicious_packages[:3])}",
+                    title=(
+                        "Suspicious package(s) in dependency tree: "
+                        f"{', '.join(tree.suspicious_packages[:3])}"
+                    ),
                     detail=(
                         f"Found {len(tree.suspicious_packages)} suspicious transitive "
                         f"dependencies: {', '.join(tree.suspicious_packages[:5])}."
@@ -1193,6 +1417,151 @@ class SupplyChainAnalyzer:
             logger.warning("Payload analysis failed for %s: %s", package_name, e)
             return []
 
+    def _check_prompt_injection(
+        self, description: str, package_name: str
+    ) -> tuple[Optional[PackageSignal], float]:
+        """Check package description for prompt injection patterns."""
+        from uast.payload import scan_for_prompt_injection
+
+        description = description or ""
+        matches = scan_for_prompt_injection(description)
+        if matches:
+            sample = matches[0][:80]
+            logger.warning(
+                "Prompt injection detected in %s description: %s", package_name, sample
+            )
+            return (
+                PackageSignal(
+                    signal_id="INJECT-001",
+                    severity="critical",
+                    title="Prompt injection pattern in package description",
+                    detail=(
+                        f"Package description contains text that may attempt to manipulate "
+                        f"AI coding agents: \"{sample}\". "
+                        f"Found {len(matches)} injection pattern(s)."
+                    ),
+                    score_contribution=0.9,
+                ),
+                0.9,
+            )
+        return None, 0.0
+
+    # -- AVT-D4: Trust & Identity checks ----------------------------------------
+
+    # Disposable email domains commonly used in throwaway accounts
+    DISPOSABLE_EMAIL_DOMAINS = {
+        "mailinator.com", "tempmail.com", "throwaway.email", "guerrillamail.com",
+        "sharklasers.com", "guerrillamail.info", "grr.la", "guerrillamail.biz",
+        "guerrillamail.de", "guerrillamail.net", "guerrillamail.org",
+        "yopmail.com", "yopmail.fr", "cool.fr.nf", "jetable.fr.nf",
+        "trashmail.com", "trashmail.org", "trashmail.me", "trashmail.net",
+        "dispostable.com", "maildrop.cc", "mailnesia.com", "tempail.com",
+        "tempr.email", "10minutemail.com", "20minutemail.com",
+        "mohmal.com", "getnada.com", "emailondeck.com", "temp-mail.org",
+    }
+
+    def _check_maintainer_trust(
+        self, info: dict, ecosystem: str
+    ) -> tuple[Optional[PackageSignal], float]:
+        """MAINTAINER-001: Check maintainer trustworthiness signals."""
+        issues = []
+
+        if ecosystem == "pypi":
+            author_email = info.get("author_email", "") or ""
+            author = info.get("author", "") or ""
+
+            # Check disposable email
+            if author_email:
+                domain = author_email.split("@")[-1].lower() if "@" in author_email else ""
+                if domain in self.DISPOSABLE_EMAIL_DOMAINS:
+                    issues.append(f"author email uses disposable domain: {domain}")
+
+            # No author identity at all
+            if not author and not author_email:
+                issues.append("no author identity (name or email)")
+
+        elif ecosystem == "npm":
+            maintainers = info.get("maintainers", [])
+            author = info.get("author", {})
+
+            # Single maintainer with no other identity signals
+            if len(maintainers) == 1:
+                maintainers[0].get("name", "") if maintainers else ""
+                m_email = maintainers[0].get("email", "") if maintainers else ""
+                if m_email:
+                    domain = m_email.split("@")[-1].lower() if "@" in m_email else ""
+                    if domain in self.DISPOSABLE_EMAIL_DOMAINS:
+                        issues.append(f"sole maintainer uses disposable email: {domain}")
+
+            if not maintainers and not author:
+                issues.append("no maintainer or author information")
+
+        if issues:
+            score = min(0.3 * len(issues), 0.7)
+            return PackageSignal(
+                signal_id="MAINTAINER-001",
+                severity="medium" if len(issues) >= 2 else "low",
+                title=f"Maintainer trust concern ({len(issues)} issue(s))",
+                detail=(
+                    f"Maintainer identity signals: {'; '.join(issues)}. "
+                    "Packages with weak maintainer provenance carry higher impersonation risk."
+                ),
+                score_contribution=score,
+            ), score
+
+        return None, 0.0
+
+    def _check_metadata_spoofing(
+        self, info: dict, package_name: str, ecosystem: str
+    ) -> tuple[Optional[PackageSignal], float]:
+        """SPOOF-001: Detect metadata that appears deliberately misleading."""
+        issues = []
+
+        if ecosystem == "pypi":
+            summary = (info.get("summary", "") or "").lower()
+            description = (info.get("description", "") or "").lower()
+            (info.get("author", "") or "").lower()
+            (info.get("home_page", "") or "").lower()
+
+            # Check if description mentions a different popular package name
+            for popular in POPULAR_PYPI:
+                pop_lower = popular.lower()
+                if pop_lower != package_name.lower() and pop_lower in summary:
+                    # The description references a different well-known package
+                    # This could be a squatter copying descriptions
+                    issues.append(
+                        f"description references popular package '{popular}' "
+                        f"but package name is '{package_name}'"
+                    )
+                    break
+
+        elif ecosystem == "npm":
+            description = (info.get("description", "") or "").lower()
+
+            for popular in POPULAR_NPM:
+                pop_lower = popular.lower()
+                if pop_lower != package_name.lower() and pop_lower in description:
+                    issues.append(
+                        f"description references popular package '{popular}' "
+                        f"but package name is '{package_name}'"
+                    )
+                    break
+
+        if issues:
+            score = min(0.4 * len(issues), 0.8)
+            return PackageSignal(
+                signal_id="SPOOF-001",
+                severity="high" if len(issues) >= 2 else "medium",
+                title=f"Potential metadata spoofing ({len(issues)} indicator(s))",
+                detail=(
+                    f"Metadata inconsistencies: {'; '.join(issues)}. "
+                    "This may indicate a deliberately misleading package."
+                ),
+                score_contribution=score,
+            ), score
+
+        return None, 0.0
+
     # -- Legacy compat method (used by tests) ---------------------------------
 
     def _check_dependency_depth(
@@ -1237,7 +1606,21 @@ class SupplyChainAnalyzer:
         has_pattern = any("PATTERN" in s.signal_id for s in signals)
         has_payload = any("PAYLOAD" in s.signal_id for s in signals)
         has_depth_susp = any("DEPTH-SUSP" in s.signal_id for s in signals)
+        has_inject = any("INJECT" in s.signal_id for s in signals)
+        has_poison = any("POISON" in s.signal_id for s in signals)
+        has_priv = any("PRIV" in s.signal_id for s in signals)
+        has_scope = any("SCOPE" in s.signal_id for s in signals)
+        has_spoof = any("SPOOF" in s.signal_id for s in signals)
+        has_maintainer = any("MAINTAINER" in s.signal_id for s in signals)
 
+        if has_inject or has_poison:
+            avt_classes.append("AVT-D1-01")
+        if has_priv:
+            avt_classes.append("AVT-D2-01")
+        if has_scope:
+            avt_classes.append("AVT-D2-02")
+        if has_spoof or has_maintainer:
+            avt_classes.append("AVT-D4-01")
         if has_squatting:
             avt_classes.append("AVT-D3-01")
         if has_halluc:

@@ -17,10 +17,9 @@ from __future__ import annotations
 import logging
 import os
 import stat
-from pathlib import Path
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Optional
-
 
 LOG_DIR = Path.home() / ".uast" / "logs"
 LOG_FILE = LOG_DIR / "uast.log"

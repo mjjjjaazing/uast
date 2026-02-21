@@ -223,9 +223,16 @@ def _validate_config(config: dict[str, Any]) -> list[str]:
 
     # http settings
     if "http" in config:
-        for key, limits in [("timeout", (1, 120)), ("cache_ttl", (0, 3600)), ("max_concurrent", (1, 50))]:
+        http_limits = [
+            ("timeout", (1, 120)),
+            ("cache_ttl", (0, 3600)),
+            ("max_concurrent", (1, 50)),
+        ]
+        for key, limits in http_limits:
             val = config["http"].get(key)
-            if val is not None and (not isinstance(val, (int, float)) or val < limits[0] or val > limits[1]):
+            if (val is not None
+                    and (not isinstance(val, (int, float))
+                         or val < limits[0] or val > limits[1])):
                 warnings.append(f"http.{key} must be {limits[0]}–{limits[1]}, got {val!r}")
                 del config["http"][key]
 

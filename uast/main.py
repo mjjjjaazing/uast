@@ -6,23 +6,20 @@ Detects supply chain attacks, compromised dependencies, and suspicious
 agent behavior that SAST and DAST were never designed to catch.
 """
 
-import sys
+import datetime
 import json as json_mod
 import signal
-import datetime
+import sys
 from pathlib import Path
 
 import click
 from rich.console import Console
-from rich.panel import Panel
-from rich.text import Text
 
-from uast.watcher import AgentWatcher
-from uast.reporter import SessionReporter
+from uast.config import get_agent_aal, get_threshold, load_config
 from uast.display import Display
-from uast.analyzer import AGENT_AAL
-from uast.config import load_config, get_threshold, get_agent_aal
 from uast.logging import setup_logging
+from uast.reporter import SessionReporter
+from uast.watcher import AgentWatcher
 
 console = Console()
 
@@ -235,7 +232,10 @@ def sessions() -> None:
     display = Display(console)
 
     if not sessions_dir.exists() or not list(sessions_dir.glob("*.json")):
-        console.print("\n[dim]No sessions found. Run [bold]uast start[/bold] to begin monitoring.[/dim]\n")
+        console.print(
+            "\n[dim]No sessions found. Run [bold]uast start[/bold]"
+            " to begin monitoring.[/dim]\n"
+        )
         return
 
     display.list_sessions(sessions_dir)

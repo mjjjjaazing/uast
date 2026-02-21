@@ -39,6 +39,13 @@ UAST closes that gap.
 | Hallucinated package names | AVT-D1-03 | Registry 404 detection + "did you mean?" |
 | Sparse / suspicious metadata | AVT-D4-01 | Metadata completeness + repository URL verification |
 | Download velocity anomalies | AVT-D3-01 | PyPI Stats / npm downloads API |
+| Prompt injection in descriptions | AVT-D1-01 | Regex pattern matching (17 patterns) |
+| Context poisoning | AVT-D1-01 | AST detection of env/sys.path manipulation |
+| Privilege escalation in packages | AVT-D2-01 | AST detection of setuid/sudo/chmod patterns |
+| Scope creep imports | AVT-D2-02 | Sensitive module import detection |
+| Maintainer trust signals | AVT-D4-01 | Disposable email, missing identity detection |
+| Metadata spoofing | AVT-D4-01 | Cross-reference description vs package identity |
+| Release pattern anomalies | AVT-D3-01 | Single-version and rapid-fire release detection |
 
 ---
 
@@ -304,7 +311,7 @@ pypi = ["my-internal-package"]
 - Terminal output + JSON session reports (schema v2)
 - Claude Code, Cursor, Copilot, Windsurf, Codeium
 
-**v0.2 — current (foundation hardening)**
+**v0.2 (foundation hardening)**
 - TOML configuration system (project + user + defaults)
 - Structured logging with rotation and log injection prevention
 - HTTP retry with exponential backoff
@@ -313,9 +320,20 @@ pypi = ["my-internal-package"]
 - CI/CD pipeline (GitHub Actions, pre-commit, PyPI publishing)
 - 322 tests, 85% coverage
 
-**v0.3**
+**v0.3 — current (detection engine expansion)**
+- AVT D1 detectors: prompt injection (INJECT-001), context poisoning (POISON-001)
+- AVT D2 detectors: privilege escalation (PRIV-001), scope creep (SCOPE-001)
+- AVT D4 detectors: maintainer trust (MAINTAINER-001), metadata spoofing (SPOOF-001)
+- Dynamic CIS scoring (Context Integrity Score degrades on injection/poisoning signals)
+- Scoring confidence levels (high/medium/low)
+- Release pattern analysis (single-version, rapid-fire release detection)
+- Rebalanced ARSM signal weights (9 categories)
+- 424 tests, 87% coverage
+
+**v0.4**
 - Web dashboard with session history
-- Full AVT taxonomy classifier (all 22 classes)
+- Threat intelligence integration (OSV.dev, safety-db)
+- npm payload analysis (JS/TS AST scanning)
 - Team sharing + alert webhooks (Slack, email)
 
 **v0.4**

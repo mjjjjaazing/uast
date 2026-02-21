@@ -20,24 +20,22 @@ from __future__ import annotations
 
 import logging
 import re
-import os
-import time
-import threading
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
-logger = logging.getLogger("uast.watcher")
-
 import psutil
+from watchdog.events import FileModifiedEvent, FileSystemEventHandler
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileModifiedEvent
 
-from uast.analyzer import SupplyChainAnalyzer, AnalysisResult
+from uast.analyzer import SupplyChainAnalyzer
 from uast.config import DEFAULT_CONFIG, get_watcher_config
 from uast.display import Display
 from uast.reporter import SessionReporter
 
+logger = logging.getLogger("uast.watcher")
 
 # Files the file watcher monitors for dependency changes
 DEPENDENCY_FILES = {
@@ -96,7 +94,8 @@ validate_pkg_name() {
 # Check requirements.txt changes
 for f in requirements.txt requirements-dev.txt; do
     if git diff --cached --name-only | grep -q "$f"; then
-        ADDED=$(git diff --cached "$f" | grep '^+' | grep -v '^+++' | sed 's/^+//' | grep -v '^#' | grep -v '^-')
+        ADDED=$(git diff --cached "$f" | grep '^+' | grep -v '^+++' \\
+            | sed 's/^+//' | grep -v '^#' | grep -v '^-')
         for pkg in $ADDED; do
             PKG_NAME=$(echo "$pkg" | sed 's/[><=!~].*//')
             if [ -n "$PKG_NAME" ] && validate_pkg_name "$PKG_NAME"; then
@@ -108,9 +107,13 @@ done
 
 # Check package.json changes
 if git diff --cached --name-only | grep -q "package.json"; then
-    ADDED=$(git diff --cached package.json | grep '^+' | grep -v '^+++' | grep '"[^"]*":' | sed 's/.*"\\([^"]*\\)".*/\\1/')
+    ADDED=$(git diff --cached package.json | grep '^+' \\
+        | grep -v '^+++' | grep '"[^"]*":' \\
+        | sed 's/.*"\\([^"]*\\)".*/\\1/')
     for pkg in $ADDED; do
-        if [ -n "$pkg" ] && [ "$pkg" != "dependencies" ] && [ "$pkg" != "devDependencies" ] && validate_pkg_name "$pkg"; then
+        if [ -n "$pkg" ] && [ "$pkg" != "dependencies" ] \\
+            && [ "$pkg" != "devDependencies" ] \\
+            && validate_pkg_name "$pkg"; then
             uast check "$pkg" --ecosystem npm 2>/dev/null
         fi
     done
@@ -264,7 +267,7 @@ class ClaudeCodeLogHandler(FileSystemEventHandler):
             return
 
         path = Path(event.src_path)
-        if not path.suffix in (".log", ".jsonl"):
+        if path.suffix not in (".log", ".jsonl"):
             return
 
         try:

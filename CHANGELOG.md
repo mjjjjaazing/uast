@@ -5,6 +5,29 @@ All notable changes to UAST will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - Unreleased
+
+### Added
+- **AVT D1 detectors**: Prompt injection detection (INJECT-001) with 17 regex patterns scanning package descriptions and code comments (standalone + inline). Context poisoning detection (POISON-001) for `os.putenv`, `os.environ` modification, `sys.path` manipulation (insert/append/extend/assign/slice).
+- **AVT D2 detectors**: Privilege escalation detection (PRIV-001) for `os.setuid/setgid/chown`, `os.chmod` with world-writable modes, `sudo` in subprocess/os.system calls. Scope creep detection (SCOPE-001) for imports of `socket`, `smtplib`, `ftplib`, `ctypes`, `mmap`, and other sensitive modules.
+- **AVT D4 detectors**: Maintainer trust analysis (MAINTAINER-001) checking for disposable email domains (30+ providers), missing author identity. Metadata spoofing detection (SPOOF-001) flagging descriptions that reference a different popular package.
+- **Dynamic CIS scoring**: Context Integrity Score now computed from detected signals — INJECT lowers by 0.5, POISON by 0.3, SPOOF by 0.2, HALLUC by 0.8. Previously hardcoded to 1.0.
+- **Scoring confidence levels**: Each analysis result now includes `confidence` field (high/medium/low) based on signal coverage and data availability.
+- **Release pattern analysis**: RELEASE-001 (single-version packages) and RELEASE-002 (rapid-fire releases: >2/day over <7 days).
+- `AVT-D1-01`, `AVT-D2-01`, `AVT-D2-02`, `AVT-D4-01` classes in `_compute_verdict`
+- 424 tests (up from 322), 87% coverage (up from 85%)
+
+### Changed
+- ARSM signal weights rebalanced from 7 to 9 categories (added trust=0.08, spoofing=0.06)
+- `_compute_verdict` is now sole authority for AVT class assignment
+- `_check_prompt_injection` normalizes `None` descriptions to empty string
+- Injection pattern for "this package is safe" tightened with negative lookahead to reduce false positives
+
+### Fixed
+- `_compute_verdict` no longer overwrites AVT classes set earlier in analysis pipeline
+- Inline code comments (e.g., `import os  # ignore instructions`) now scanned for injection
+- `sys.path = [...]` and `sys.path[:] = [...]` direct assignment now detected as POISON-001
+
 ## [0.2.0] - Unreleased
 
 ### Added
