@@ -5,6 +5,24 @@ All notable changes to UAST will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - Unreleased
+
+### Added
+- **Threat intelligence (OSV.dev)**: Real-time vulnerability lookup via OSV.dev API. New signal category `threat_intel` with VULN-001 (known vulnerability, severity from CVSS) and VULN-002 (multiple vulnerabilities, critical). Dedicated HTTP client with 1-hour cache TTL for vulnerability data.
+- **npm payload analysis**: Regex-based scanning of JS/TS files in npm packages. 7 detection patterns: child_process (JS-PAYLOAD-001), eval/new Function (JS-PAYLOAD-002), base64 encoding (JS-PAYLOAD-003), sensitive file writes (JS-PAYLOAD-004), process.env gating (JS-PAYLOAD-005), network calls in install scripts (JS-PAYLOAD-006), raw socket usage (JS-PAYLOAD-007). Install script detection from package.json preinstall/postinstall hooks with severity elevation.
+- **Alert webhooks (Slack + generic)**: `WebhookDispatcher` fires to Slack (Block Kit format) and/or generic HTTP endpoint when packages exceed threshold. Per-package rate limiting, configurable verdict filter and minimum ARS score. `uast notify <session>` command for manual session summary dispatch. `--webhook-url` CLI flag for quick setup.
+- **Web dashboard**: Lightweight Flask-based session viewer at `uast dashboard`. Server-rendered HTML with dark theme. Routes: session list, session detail, package detail with signals/ARSM/provenance. JSON API endpoints. Security: 127.0.0.1 binding, path traversal prevention, X-Content-Type-Options/X-Frame-Options headers. Optional dependency: `pip install uast[dashboard]`.
+- npm tarball download support in `package_utils.py` for npm payload analysis
+- `[webhooks]`, `[threat_intel]`, `[dashboard]` config sections in `.uast.toml`
+- Report schema v4 with `threat_intel` field per result
+- 691 tests (up from 547), 83% coverage
+
+### Changed
+- ARSM signal weights rebalanced from 10 to 11 categories (added threat_intel=0.08, rebalanced age_velocity 0.18→0.15, payload 0.18→0.15, name_squatting 0.14→0.13, provenance 0.10→0.09)
+- HTTP client now supports POST requests (prerequisite for OSV.dev API and webhooks)
+- Payload analysis dispatcher now routes npm packages to JSPayloadAnalyzer (previously stubbed)
+- Version bumped to 0.5.0
+
 ## [0.4.0] - Unreleased
 
 ### Added

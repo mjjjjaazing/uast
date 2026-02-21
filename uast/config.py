@@ -125,6 +125,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "timeout": 60,
     },
 
+    # Webhooks (alert notifications)
+    "webhooks": {
+        "slack_url": "",
+        "generic_url": "",
+        "on_verdict": ["critical", "suspicious"],
+        "min_ars_score": 6.0,
+        "include_signals": True,
+        "rate_limit_seconds": 10,
+    },
+
+    # Threat intelligence (OSV.dev)
+    "threat_intel": {
+        "enabled": True,
+        "cache_ttl": 3600,
+    },
+
+    # Dashboard settings
+    "dashboard": {
+        "host": "127.0.0.1",
+        "port": 8080,
+    },
+
     # Custom allowlists (user additions — merged with built-in)
     "allowlist": {
         "pypi": [],

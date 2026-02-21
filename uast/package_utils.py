@@ -98,7 +98,7 @@ def extract_archive(path: str, dest: str) -> bool:
     Returns True on success, False on failure.
     """
     try:
-        if path.endswith((".tar.gz", ".tar.bz2")):
+        if path.endswith((".tar.gz", ".tar.bz2", ".tgz")):
             with tarfile.open(path) as tf:
                 members = []
                 for m in tf.getmembers():
@@ -119,9 +119,76 @@ def extract_archive(path: str, dest: str) -> bool:
     return False
 
 
+def download_npm_package(
+    name: str,
+    version: Optional[str],
+    dest_dir: str,
+    timeout: int = 60,
+) -> Optional[str]:
+    """
+    Download an npm package tarball via the npm registry API.
+
+    Args:
+        name: Package name.
+        version: Specific version, or None for latest.
+        dest_dir: Directory to download into.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        Path to the downloaded tarball, or None on failure.
+    """
+    from uast.http_client import http_client
+
+    # Validate package name
+    if not name or not re.match(r"^[@a-zA-Z0-9][\w.@/\-]{0,213}$", name):
+        logger.warning("Invalid npm package name for download: %r", name)
+        return None
+
+    try:
+        # Fetch package metadata
+        if version:
+            url = f"https://registry.npmjs.org/{name}/{version}"
+        else:
+            url = f"https://registry.npmjs.org/{name}/latest"
+
+        resp = http_client.get(url, timeout=timeout)
+        if resp.status_code != 200:
+            logger.warning("npm registry returned %d for %s", resp.status_code, name)
+            return None
+
+        data = resp.json()
+        tarball_url = data.get("dist", {}).get("tarball")
+        if not tarball_url:
+            logger.warning("No tarball URL in npm metadata for %s", name)
+            return None
+
+        # Download tarball
+        import requests
+        tarball_resp = requests.get(tarball_url, timeout=timeout, stream=True)
+        if tarball_resp.status_code != 200:
+            logger.warning("Tarball download failed for %s: %d", name, tarball_resp.status_code)
+            return None
+
+        # Write to dest_dir
+        tarball_name = tarball_url.split("/")[-1]
+        if not tarball_name.endswith(".tgz"):
+            tarball_name = f"{name.replace('/', '-')}-{version or 'latest'}.tgz"
+        dest_path = os.path.join(dest_dir, tarball_name)
+
+        with open(dest_path, "wb") as f:
+            for chunk in tarball_resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        return dest_path
+
+    except Exception as e:
+        logger.warning("npm package download failed for %s: %s", name, e)
+        return None
+
+
 def _find_archive(directory: str) -> Optional[str]:
     """Find the first archive file in a directory."""
     for f in os.listdir(directory):
-        if f.endswith((".tar.gz", ".zip", ".whl", ".tar.bz2")):
+        if f.endswith((".tar.gz", ".tgz", ".zip", ".whl", ".tar.bz2")):
             return os.path.join(directory, f)
     return None

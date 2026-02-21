@@ -331,6 +331,10 @@ class AgentWatcher:
         self.analyzer = SupplyChainAnalyzer(
             aal=aal, deep=deep, config=self.config, provenance=provenance,
         )
+
+        # Webhook dispatcher (lazy: only active if configured)
+        from uast.webhooks import WebhookDispatcher
+        self.webhook_dispatcher = WebhookDispatcher(self.config, display=display)
         self._seen_pids: dict[int, str] = {}  # pid → package_name
         self._analyzed: set[str] = set()  # "ecosystem:pkg" already analyzed
         self._lock = threading.Lock()
@@ -557,6 +561,10 @@ class AgentWatcher:
 
         self.display.show_result(result, self.threshold)
         self.reporter.add_result(result, source)
+
+        # Fire webhooks if result exceeds threshold
+        if result.ars_score >= self.threshold:
+            self.webhook_dispatcher.fire(result)
 
         # If blocking mode is on and score exceeds threshold, attempt to
         # kill the install process, then rollback if needed

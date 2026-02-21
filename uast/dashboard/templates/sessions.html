@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Sessions - UAST Dashboard{% endblock %}
+{% block content %}
+<h1>Session History</h1>
+
+{% if sessions %}
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>Date</th>
+            <th>Agent</th>
+            <th>Project</th>
+            <th>Packages</th>
+            <th>Alerts</th>
+            <th>Critical</th>
+            <th>Suspicious</th>
+            <th>Max ARS</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for s in sessions %}
+        <tr class="{% if s.critical > 0 %}row-critical{% elif s.alerts > 0 %}row-warning{% endif %}">
+            <td><a href="{{ url_for('session_detail', filename=s.filename) }}">{{ s.started_at or s.filename }}</a></td>
+            <td>{{ s.agent }}</td>
+            <td class="path-cell">{{ s.project }}</td>
+            <td>{{ s.total_packages }}</td>
+            <td>{{ s.alerts }}</td>
+            <td>{{ s.critical }}</td>
+            <td>{{ s.suspicious }}</td>
+            <td class="{% if s.max_ars_score >= 8.0 %}score-critical{% elif s.max_ars_score >= 6.0 %}score-warning{% else %}score-clean{% endif %}">
+                {{ "%.1f"|format(s.max_ars_score) }}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<div class="empty-state">
+    <p>No sessions found.</p>
+    <p class="dim">Run <code>uast start</code> to begin monitoring.</p>
+</div>
+{% endif %}
+{% endblock %}

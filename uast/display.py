@@ -203,6 +203,17 @@ class Display:
             highlight=False,
         )
 
+    def webhook_fired(self, channel: str, package_name: str) -> None:
+        """Confirm a webhook notification was sent."""
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self.console.print(
+            f"  [dim][{ts}][/dim]  "
+            f"[bold]webhook[/bold]  "
+            f"[dim]{channel} notification sent for[/dim]  "
+            f"[bold]{package_name}[/bold]",
+            highlight=False,
+        )
+
     # -- Session end ----------------------------------------------------------
 
     def shutdown(self, output_path: Path) -> None:
@@ -305,6 +316,30 @@ class Display:
                     highlight=False,
                 )
                 self.console.print()
+
+        # Threat intelligence
+        if result.threat_intel:
+            self.console.print()
+            self.console.print("  [dim]Threat Intelligence[/dim]")
+            vulns = result.threat_intel.get("vulnerabilities", [])
+            source = result.threat_intel.get("source", "osv.dev")
+            self.console.print(
+                f"  [dim]Source: {source} · {len(vulns)} advisory/ies[/dim]"
+            )
+            for v in vulns[:5]:
+                sev = v.get("severity", "unknown")
+                sev_color = SEVERITY_COLORS.get(sev, "dim")
+                fixed = f" → fixed in {v.get('fixed_in')}" if v.get("fixed_in") else ""
+                self.console.print(
+                    f"  [{sev_color}][{sev.upper()}][/{sev_color}]  "
+                    f"[bold]{v.get('id', '?')}[/bold]  "
+                    f"[dim]{v.get('summary', '')[:80]}{fixed}[/dim]",
+                    highlight=False,
+                )
+            if len(vulns) > 5:
+                self.console.print(
+                    f"  [dim]... and {len(vulns) - 5} more[/dim]"
+                )
 
         # Provenance info
         if result.provenance:

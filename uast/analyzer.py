@@ -88,6 +88,7 @@ class AnalysisResult:
     dependency_tree_hash: Optional[str] = None  # Merkle root hash of dep tree
     provenance: Optional[dict] = None    # provenance verification results
     version_diff: Optional[dict] = None  # version diff results
+    threat_intel: Optional[dict] = None  # threat intelligence results
 
     @property
     def is_flagged(self) -> bool:
@@ -225,16 +226,17 @@ class SupplyChainAnalyzer:
 
     # Signal weights (sum to 1.0)
     WEIGHTS = {
-        "age_velocity":   0.18,
-        "name_squatting": 0.14,
+        "age_velocity":   0.15,
+        "name_squatting": 0.13,
         "pattern_match":  0.05,
         "metadata":       0.05,
         "depth":          0.08,
-        "payload":        0.18,
+        "payload":        0.15,
         "injection":      0.10,
         "trust":          0.07,
         "spoofing":       0.05,
-        "provenance":     0.10,
+        "provenance":     0.09,
+        "threat_intel":   0.08,
     }
 
     def __init__(
@@ -263,6 +265,10 @@ class SupplyChainAnalyzer:
     def _get_payload_analyzer(self):
         from uast.payload import PayloadAnalyzer
         return PayloadAnalyzer()
+
+    def _get_threat_intel_checker(self):
+        from uast.threat_intel import ThreatIntelChecker
+        return ThreatIntelChecker(self.config)
 
     def analyze_pypi(self, package_name: str) -> AnalysisResult:
         """Analyze a PyPI package and return an AnalysisResult."""
@@ -457,6 +463,16 @@ class SupplyChainAnalyzer:
                     )
         raw_score += max(provenance_contribution, 0.0) * self.WEIGHTS["provenance"]
 
+        # -- Signal 11: Threat intelligence (OSV.dev) --------------------------
+        ti_signals, ti_contribution, ti_data = self._check_threat_intel(
+            package_name, "pypi", result.version,
+        )
+        for s in ti_signals:
+            result.signals.append(s)
+        raw_score += ti_contribution * self.WEIGHTS["threat_intel"]
+        if ti_data:
+            result.threat_intel = ti_data
+
         # -- Version diff (deep mode) -----------------------------------------
         if self.deep and result.version != "unknown":
             vdiff_signals = self._check_version_diff(package_name, result.version)
@@ -623,8 +639,14 @@ class SupplyChainAnalyzer:
             result.signals.append(s)
         raw_score += depth_contribution * self.WEIGHTS["depth"]
 
-        # -- Signal 6: Payload (npm not supported yet) ------------------------
-        # payload analysis only for pypi currently
+        # -- Signal 6: Payload analysis (npm JS scanning) ----------------------
+        payload_contribution = 0.0
+        if self.deep:
+            payload_signals = self._check_payload(package_name, "npm", latest_version)
+            for s in payload_signals:
+                result.signals.append(s)
+                payload_contribution = max(payload_contribution, s.score_contribution)
+        raw_score += payload_contribution * self.WEIGHTS["payload"]
 
         # -- Signal 7: Prompt injection in description ------------------------
         inject_signal, inject_contribution = self._check_prompt_injection(
@@ -648,6 +670,16 @@ class SupplyChainAnalyzer:
         if spoof_signal:
             result.signals.append(spoof_signal)
         raw_score += spoof_contribution * self.WEIGHTS["spoofing"]
+
+        # -- Signal 10: Threat intelligence (OSV.dev) -------------------------
+        ti_signals, ti_contribution, ti_data = self._check_threat_intel(
+            package_name, "npm", result.version,
+        )
+        for s in ti_signals:
+            result.signals.append(s)
+        raw_score += ti_contribution * self.WEIGHTS["threat_intel"]
+        if ti_data:
+            result.threat_intel = ti_data
 
         # -- Compute ARSM score -----------------------------------------------
         result.cvss_base = round(min(raw_score * 10.0, 10.0), 1)
@@ -1609,6 +1641,28 @@ class SupplyChainAnalyzer:
             ), score
 
         return None, 0.0
+
+    # -- Threat intelligence checks ------------------------------------------
+
+    def _check_threat_intel(
+        self, name: str, ecosystem: str, version: Optional[str] = None
+    ) -> tuple[list[PackageSignal], float, Optional[dict]]:
+        """Query OSV.dev for known vulnerabilities."""
+        try:
+            checker = self._get_threat_intel_checker()
+            signals, max_contribution, vuln_dicts = checker.check(
+                name, ecosystem, version
+            )
+            ti_data = None
+            if vuln_dicts:
+                ti_data = {
+                    "vulnerabilities": vuln_dicts,
+                    "source": "osv.dev",
+                }
+            return signals, max_contribution, ti_data
+        except Exception as e:
+            logger.warning("Threat intel check failed for %s: %s", name, e)
+            return [], 0.0, None
 
     # -- Provenance & version diff checks -----------------------------------
 

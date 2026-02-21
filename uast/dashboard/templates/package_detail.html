@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% block title %}{{ pkg.package_name }} - UAST Dashboard{% endblock %}
+{% block content %}
+<div class="breadcrumb">
+    <a href="{{ url_for('sessions_list') }}">Sessions</a> &rsaquo;
+    <a href="{{ url_for('session_detail', filename=filename) }}">{{ filename }}</a> &rsaquo;
+    {{ pkg.package_name }}
+</div>
+
+<h1>
+    {{ pkg.package_name }}
+    <span class="verdict verdict-{{ pkg.verdict }}">{{ pkg.verdict }}</span>
+</h1>
+
+<div class="summary-cards">
+    <div class="card">
+        <div class="card-label">Ecosystem</div>
+        <div class="card-value">{{ pkg.ecosystem }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Version</div>
+        <div class="card-value">{{ pkg.version or '-' }}</div>
+    </div>
+    <div class="card {% if pkg.ars_score >= 8.0 %}card-critical{% elif pkg.ars_score >= 6.0 %}card-alert{% endif %}">
+        <div class="card-label">ARS Score</div>
+        <div class="card-value">{{ "%.1f"|format(pkg.ars_score) }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">CVSS Base</div>
+        <div class="card-value">{{ "%.1f"|format(pkg.cvss_base) if pkg.cvss_base else '-' }}</div>
+    </div>
+</div>
+
+{% if pkg.recommendation %}
+<div class="recommendation">
+    <strong>Recommendation:</strong> {{ pkg.recommendation }}
+</div>
+{% endif %}
+
+{% if pkg.arsm %}
+<h2>ARSM Breakdown</h2>
+<div class="arsm-grid">
+    <div class="arsm-item">
+        <span class="arsm-label">ARS (Base Risk)</span>
+        <span class="arsm-value">{{ "%.1f"|format(pkg.arsm.ars) if pkg.arsm.ars is defined else '-' }}</span>
+    </div>
+    <div class="arsm-item">
+        <span class="arsm-label">AAL (Agent Autonomy)</span>
+        <span class="arsm-value">{{ "%.2f"|format(pkg.arsm.aal) if pkg.arsm.aal is defined else '-' }}</span>
+    </div>
+    <div class="arsm-item">
+        <span class="arsm-label">CIS (Context Impact)</span>
+        <span class="arsm-value">{{ "%.2f"|format(pkg.arsm.cis) if pkg.arsm.cis is defined else '-' }}</span>
+    </div>
+    <div class="arsm-item">
+        <span class="arsm-label">ARSM (Final)</span>
+        <span class="arsm-value arsm-final">{{ "%.1f"|format(pkg.arsm.arsm) if pkg.arsm.arsm is defined else '-' }}</span>
+    </div>
+</div>
+{% endif %}
+
+<h2>Signals ({{ pkg.signals|length if pkg.signals else 0 }})</h2>
+
+{% if pkg.signals %}
+<table class="data-table signals-table">
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Severity</th>
+            <th>Title</th>
+            <th>Detail</th>
+            <th>Score</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for s in pkg.signals %}
+        <tr class="severity-{{ s.severity }}">
+            <td><code>{{ s.signal_id }}</code></td>
+            <td><span class="severity-badge severity-badge-{{ s.severity }}">{{ s.severity }}</span></td>
+            <td>{{ s.title }}</td>
+            <td class="detail-cell">{{ s.detail }}</td>
+            <td>{{ "%.2f"|format(s.score_contribution) }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<div class="empty-state">
+    <p>No signals detected.</p>
+</div>
+{% endif %}
+
+{% if pkg.threat_intel and pkg.threat_intel.vulnerabilities %}
+<h2>Threat Intelligence</h2>
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>Vulnerability ID</th>
+            <th>Severity</th>
+            <th>Summary</th>
+            <th>Fixed In</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for v in pkg.threat_intel.vulnerabilities %}
+        <tr>
+            <td><code>{{ v.id }}</code></td>
+            <td>{{ v.severity or '-' }}</td>
+            <td>{{ v.summary or '-' }}</td>
+            <td>{{ v.fixed_in or '-' }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+{% if pkg.provenance %}
+<h2>Provenance</h2>
+<div class="provenance-info">
+    <p><strong>Status:</strong> {{ pkg.provenance.status if pkg.provenance.status is defined else '-' }}</p>
+    {% if pkg.provenance.details %}
+    <p>{{ pkg.provenance.details }}</p>
+    {% endif %}
+</div>
+{% endif %}
+{% endblock %}

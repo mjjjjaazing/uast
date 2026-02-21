@@ -190,3 +190,75 @@ class TestCachedHTTPClient:
         assert 504 in RETRYABLE_STATUS_CODES
         assert 400 not in RETRYABLE_STATUS_CODES
         assert 404 not in RETRYABLE_STATUS_CODES
+
+    # -- POST method tests ---------------------------------------------------
+
+    def test_post_returns_response(self):
+        client = self._make_client()
+        resp = self._mock_response(200, {"result": "ok"})
+        with patch.object(client._session, "request", return_value=resp) as mock_req:
+            result = client.post("https://example.com/api", json={"query": "test"})
+            assert result.status_code == 200
+            mock_req.assert_called_once()
+            call_kwargs = mock_req.call_args
+            assert call_kwargs[0][0] == "POST"
+            assert call_kwargs[1]["json"] == {"query": "test"}
+
+    def test_post_not_cached(self):
+        client = self._make_client()
+        resp = self._mock_response(200)
+        with patch.object(client._session, "request", return_value=resp) as mock_req:
+            client.post("https://example.com/api", json={"a": 1})
+            client.post("https://example.com/api", json={"a": 1})
+            # POST should never be cached — both calls hit the network
+            assert mock_req.call_count == 2
+        assert client.cache_size == 0
+
+    @patch("uast.http_client.time.sleep")
+    def test_post_retry_on_500(self, mock_sleep):
+        client = self._make_client(max_retries=3)
+        fail_resp = self._mock_response(500)
+        ok_resp = self._mock_response(200)
+        with patch.object(
+            client._session, "request", side_effect=[fail_resp, ok_resp]
+        ):
+            result = client.post("https://example.com/api", json={"data": "x"})
+            assert result.status_code == 200
+
+    def test_post_rejects_ssrf(self):
+        client = self._make_client()
+        with pytest.raises(ValueError, match="Unsupported URL scheme"):
+            client.post("file:///etc/passwd", json={})
+
+    def test_post_rejects_no_hostname(self):
+        client = self._make_client()
+        with pytest.raises(ValueError, match="no hostname"):
+            client.post("https://", json={})
+
+    @patch("uast.http_client.time.sleep")
+    def test_post_retry_on_connection_error(self, mock_sleep):
+        client = self._make_client(max_retries=3)
+        ok_resp = self._mock_response(200)
+        with patch.object(
+            client._session,
+            "request",
+            side_effect=[requests.ConnectionError("refused"), ok_resp],
+        ):
+            result = client.post("https://example.com/api", json={"q": "test"})
+            assert result.status_code == 200
+
+    def test_post_without_json_body(self):
+        client = self._make_client()
+        resp = self._mock_response(200)
+        with patch.object(client._session, "request", return_value=resp) as mock_req:
+            result = client.post("https://example.com/api")
+            assert result.status_code == 200
+            call_kwargs = mock_req.call_args
+            assert call_kwargs[1]["json"] is None
+
+    def test_post_with_custom_timeout(self):
+        client = self._make_client()
+        resp = self._mock_response(200)
+        with patch.object(client._session, "request", return_value=resp) as mock_req:
+            client.post("https://example.com/api", json={}, timeout=30)
+            assert mock_req.call_args[1]["timeout"] == 30

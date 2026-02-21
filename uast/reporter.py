@@ -19,7 +19,7 @@ from uast.analyzer import AnalysisResult
 class SessionReporter:
     """Accumulates analysis results and writes the final JSON report."""
 
-    REPORT_VERSION = "3"
+    REPORT_VERSION = "4"
 
     def __init__(
         self,
@@ -62,6 +62,7 @@ class SessionReporter:
             "dependency_tree_hash": getattr(result, "dependency_tree_hash", None),
             "provenance": getattr(result, "provenance", None),
             "version_diff": getattr(result, "version_diff", None),
+            "threat_intel": getattr(result, "threat_intel", None),
         }
         self._results.append(entry)
 

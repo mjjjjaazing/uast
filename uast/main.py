@@ -42,7 +42,7 @@ def print_banner(agent: str, project: str, version: str = "0.1.0") -> None:
 
 
 @click.group()
-@click.version_option(version="0.4.0", prog_name="uast")
+@click.version_option(version="0.5.0", prog_name="uast")
 def cli() -> None:
     """UAST — Unified Agentic Security Testing.
 
@@ -127,6 +127,11 @@ def cli() -> None:
     default=False,
     help="Enable provenance verification (git clone + build + hash comparison).",
 )
+@click.option(
+    "--webhook-url",
+    default=None,
+    help="Generic webhook URL to POST alerts to.",
+)
 def start(
     agent: str,
     project: str,
@@ -138,6 +143,7 @@ def start(
     log_level: str,
     quiet: bool,
     provenance: bool,
+    webhook_url: "str | None",
 ) -> None:
     """Start monitoring an AI coding agent session.
 
@@ -159,6 +165,8 @@ def start(
     cli_overrides: dict = {}
     if threshold != 6.0:
         cli_overrides["threshold"] = threshold
+    if webhook_url:
+        cli_overrides.setdefault("webhooks", {})["generic_url"] = webhook_url
     config = load_config(project_path=project_path, cli_overrides=cli_overrides or None)
 
     # Resolve AAL from config (falls back to agent map)
@@ -406,6 +414,102 @@ def diff_trees(session1: str, session2: str) -> None:
     )
 
     display.show_tree_diff(result, Path(session1).name, Path(session2).name)
+
+
+@cli.command()
+@click.argument("session_path", type=click.Path(exists=True))
+def notify(session_path: str) -> None:
+    """Send a session summary via configured webhooks.
+
+    \b
+    Example:
+      uast notify ~/.uast/sessions/session_20250101_120000.json
+    """
+    config = load_config(project_path=Path("."))
+
+    with open(session_path) as f:
+        session_data = json_mod.load(f)
+
+    from uast.webhooks import WebhookDispatcher
+    dispatcher = WebhookDispatcher(config)
+
+    if not dispatcher.is_configured:
+        console.print(
+            "\n[yellow]No webhooks configured.[/yellow]\n"
+            "[dim]Set webhooks.slack_url or webhooks.generic_url in "
+            "~/.uast/config.toml[/dim]\n"
+        )
+        return
+
+    sent = dispatcher.notify_session(session_data)
+    if sent:
+        console.print("[green]✓[/green] Session summary sent via webhooks.")
+    else:
+        summary = session_data.get("summary", {})
+        if summary.get("alerts", 0) == 0:
+            console.print("[dim]No alerts in session — nothing to notify.[/dim]")
+        else:
+            console.print("[yellow]Webhook notification failed.[/yellow]")
+
+
+@cli.command()
+@click.option(
+    "--host",
+    default=None,
+    help="Host to bind to. Default: 127.0.0.1",
+)
+@click.option(
+    "--port",
+    type=int,
+    default=None,
+    help="Port to listen on. Default: 8080",
+)
+@click.option(
+    "--sessions-dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    default=None,
+    help="Directory containing session JSON files. Default: ~/.uast/sessions",
+)
+def dashboard(host: "str | None", port: "int | None", sessions_dir: "str | None") -> None:
+    """Launch the UAST web dashboard.
+
+    \b
+    Serves a lightweight web UI for browsing session reports.
+    Binds to 127.0.0.1:8080 by default (local only).
+
+    \b
+    Examples:
+      uast dashboard
+      uast dashboard --port 9090
+      uast dashboard --sessions-dir ./my-sessions
+    """
+    try:
+        from uast.dashboard.app import create_app
+    except ImportError:
+        console.print(
+            "\n[red]Flask is required for the dashboard.[/red]\n"
+            "[dim]Install it with: pip install uast[dashboard][/dim]\n"
+        )
+        sys.exit(1)
+
+    config = load_config(project_path=Path("."))
+    dash_config = config.get("dashboard", {})
+
+    effective_host = host or dash_config.get("host", "127.0.0.1")
+    effective_port = port or dash_config.get("port", 8080)
+
+    sessions_path = Path(sessions_dir) if sessions_dir else None
+
+    app = create_app(sessions_dir=sessions_path)
+
+    console.print(
+        f"\n[bold]UAST Dashboard[/bold] running at "
+        f"[link=http://{effective_host}:{effective_port}]"
+        f"http://{effective_host}:{effective_port}[/link]\n"
+        "[dim]Press Ctrl+C to stop.[/dim]\n"
+    )
+
+    app.run(host=effective_host, port=effective_port, debug=False)
 
 
 if __name__ == "__main__":

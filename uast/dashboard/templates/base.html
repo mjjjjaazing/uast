@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}UAST Dashboard{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-brand">
+            <a href="{{ url_for('sessions_list') }}">UAST</a>
+            <span class="nav-subtitle">Security Dashboard</span>
+        </div>
+        <div class="nav-links">
+            <a href="{{ url_for('sessions_list') }}">Sessions</a>
+        </div>
+    </nav>
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+    <footer class="footer">
+        <p>UAST &mdash; Unified Agentic Security Testing</p>
+    </footer>
+</body>
+</html>

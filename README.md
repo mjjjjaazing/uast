@@ -49,6 +49,8 @@ UAST closes that gap.
 | Supply chain provenance failure | AVT-D3-05 | Source-to-registry hash mismatch |
 | Suspicious version changes | AVT-D3-02 | Version diff detecting new imports, entropy, hooks |
 | Dependency tree drift | — | Merkle tree hash comparison across sessions |
+| Known vulnerabilities | — | OSV.dev threat intelligence lookup |
+| npm malicious payloads | AVT-D3-02 | Regex scanning of JS/TS files in npm packages |
 
 ---
 
@@ -101,6 +103,29 @@ uast check some-package --agent cursor
 
 # Enable provenance verification (git clone + build + hash comparison)
 uast check some-package --provenance
+```
+
+### Send alerts via webhooks
+
+```bash
+# Start with webhook notifications
+uast start --webhook-url https://api.example.com/webhook
+
+# Send a session summary manually
+uast notify ~/.uast/sessions/session_20250101_120000.json
+```
+
+### Launch the web dashboard
+
+```bash
+# Install optional dashboard dependency
+pip install uast[dashboard]
+
+# Start the dashboard (127.0.0.1:8080 by default)
+uast dashboard
+
+# Custom port
+uast dashboard --port 9090
 ```
 
 ### Compare dependency trees
@@ -244,11 +269,11 @@ pip install uast[provenance]  # requires Python 3.10+
 
 ## Session reports
 
-Every session saves a structured JSON report (schema v3):
+Every session saves a structured JSON report (schema v4):
 
 ```json
 {
-  "version": "3",
+  "version": "4",
   "agent": "cursor",
   "project": "/Users/mike/payments-api",
   "started_at": "2025-01-01T14:22:00",
@@ -346,6 +371,17 @@ max_repo_size_mb = 100 # skip repos larger than this
 [version_diff]
 enabled = true         # version diff runs automatically in deep mode
 timeout = 60
+
+[webhooks]
+slack_url = ""                          # Slack incoming webhook URL
+generic_url = ""                        # Generic HTTP endpoint
+on_verdict = ["critical", "suspicious"] # which verdicts trigger alerts
+min_ars_score = 6.0                     # minimum score to alert
+rate_limit_seconds = 10                 # per-package cooldown
+
+[dashboard]
+host = "127.0.0.1"
+port = 8080
 ```
 
 ---
@@ -385,7 +421,7 @@ timeout = 60
 - Rebalanced ARSM signal weights (9 categories)
 - 424 tests, 87% coverage
 
-**v0.4 — current (provenance chain verification)**
+**v0.4 (provenance chain verification)**
 - Source-to-registry verification: git clone + build + SHA-256 hash comparison
 - Sigstore/PEP 740 attestation checking (optional dep, Python 3.10+)
 - Version diffing: detect suspicious changes between releases (new imports, high-entropy strings, install hooks, metadata stripping)
@@ -399,11 +435,17 @@ timeout = 60
 - Report schema v3 with provenance, version_diff, and tree hash fields
 - 547 tests, 83% coverage
 
-**v0.5**
-- Web dashboard with session history
-- Threat intelligence integration (OSV.dev, safety-db)
-- npm payload analysis (JS/TS AST scanning)
-- Team sharing + alert webhooks (Slack, email)
+**v0.5 — current (detection expansion + collaboration)**
+- Threat intelligence integration (OSV.dev) with VULN-001/VULN-002 signals
+- npm payload analysis (regex-based JS/TS scanning, 7 detection patterns)
+- Alert webhooks (Slack Block Kit + generic HTTP endpoint) with rate limiting
+- Web dashboard (`uast dashboard`) for browsing session history
+- `uast notify` command for manual webhook dispatch
+- `--webhook-url` CLI flag
+- HTTP client POST support
+- ARSM rebalanced to 11 weight categories (threat_intel: 0.08)
+- Report schema v4 with threat_intel field
+- 691 tests, 83% coverage
 
 **v0.6**
 - Agent Reasoning Auditor (ARA layer)

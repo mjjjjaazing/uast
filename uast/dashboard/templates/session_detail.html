@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Session {{ filename }} - UAST Dashboard{% endblock %}
+{% block content %}
+<div class="breadcrumb">
+    <a href="{{ url_for('sessions_list') }}">Sessions</a> &rsaquo; {{ filename }}
+</div>
+
+<h1>Session Detail</h1>
+
+<div class="summary-cards">
+    <div class="card">
+        <div class="card-label">Agent</div>
+        <div class="card-value">{{ data.get('agent', 'unknown') }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Packages</div>
+        <div class="card-value">{{ summary.get('total_packages', 0) }}</div>
+    </div>
+    <div class="card {% if summary.get('alerts', 0) > 0 %}card-alert{% endif %}">
+        <div class="card-label">Alerts</div>
+        <div class="card-value">{{ summary.get('alerts', 0) }}</div>
+    </div>
+    <div class="card {% if summary.get('critical', 0) > 0 %}card-critical{% endif %}">
+        <div class="card-label">Critical</div>
+        <div class="card-value">{{ summary.get('critical', 0) }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Max ARS</div>
+        <div class="card-value">{{ "%.1f"|format(summary.get('max_ars_score', 0.0)) }}</div>
+    </div>
+</div>
+
+<h2>Analyzed Packages</h2>
+
+{% if results %}
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>Package</th>
+            <th>Ecosystem</th>
+            <th>Version</th>
+            <th>ARS Score</th>
+            <th>Verdict</th>
+            <th>Signals</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for r in results %}
+        <tr class="{% if r.verdict == 'critical' %}row-critical{% elif r.verdict == 'suspicious' %}row-warning{% endif %}">
+            <td><a href="{{ url_for('package_detail', filename=filename, index=loop.index0) }}">{{ r.package_name }}</a></td>
+            <td>{{ r.ecosystem }}</td>
+            <td>{{ r.version or '-' }}</td>
+            <td class="{% if r.ars_score >= 8.0 %}score-critical{% elif r.ars_score >= 6.0 %}score-warning{% else %}score-clean{% endif %}">
+                {{ "%.1f"|format(r.ars_score) }}
+            </td>
+            <td><span class="verdict verdict-{{ r.verdict }}">{{ r.verdict }}</span></td>
+            <td>{{ r.signals|length if r.signals else 0 }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<div class="empty-state">
+    <p>No packages analyzed in this session.</p>
+</div>
+{% endif %}
+{% endblock %}

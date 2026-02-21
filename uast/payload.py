@@ -560,9 +560,13 @@ class PayloadAnalyzer:
         if not re.match(r"^[a-zA-Z0-9][\w.\-]{0,213}$", name):
             logger.warning("Invalid package name for payload analysis: %r", name)
             return []
+        if ecosystem == "npm":
+            from uast.js_payload import JSPayloadAnalyzer
+            js_analyzer = JSPayloadAnalyzer()
+            return js_analyzer.analyze_package(name, ecosystem, version)
         if ecosystem != "pypi":
-            logger.debug("Payload analysis only supports PyPI — skipping %s", ecosystem)
-            return []  # Only Python packages supported for now
+            logger.debug("Payload analysis only supports PyPI and npm — skipping %s", ecosystem)
+            return []
 
         with tempfile.TemporaryDirectory(prefix="uast_payload_") as tmpdir:
             pkg_path = download_package(name, version, tmpdir, sdist_only=True)

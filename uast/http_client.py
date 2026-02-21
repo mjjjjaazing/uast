@@ -109,8 +109,16 @@ class CachedHTTPClient:
                 allow_redirects=True,
             )
 
+    def post(
+        self, url: str, json: object = None, timeout: Optional[int] = None,
+    ) -> requests.Response:
+        """POST request (not cached) with rate limiting and retry."""
+        self._validate_url(url)
+        effective_timeout = timeout or self._timeout
+        return self._request_with_retry("POST", url, effective_timeout, json=json)
+
     def _request_with_retry(
-        self, method: str, url: str, timeout: int
+        self, method: str, url: str, timeout: int, json: object = None
     ) -> requests.Response:
         """Execute an HTTP request with exponential backoff retry."""
         last_exc: Optional[requests.RequestException] = None
@@ -119,7 +127,7 @@ class CachedHTTPClient:
             try:
                 logger.debug("HTTP %s (attempt %d): %s", method, attempt + 1, url)
                 with self._semaphore:
-                    resp = self._session.request(method, url, timeout=timeout)
+                    resp = self._session.request(method, url, timeout=timeout, json=json)
 
                 # Don't retry deterministic client errors (400, 401, 403, 404)
                 if resp.status_code not in RETRYABLE_STATUS_CODES:
